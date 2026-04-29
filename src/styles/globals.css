@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* ═══ LEVEL UP Light Theme ═══ */
+    /* Brand: Orange (#F5A623) → Red (#E74C3C) gradient */
+    --background: 0 0% 97%;
+    /* #f7f7f7 warm white */
+    --foreground: 220 15% 20%;
+    /* #2d3748 dark slate */
+    --card: 0 0% 100%;
+    /* #ffffff */
+    --card-foreground: 220 15% 20%;
+    /* #2d3748 */
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 15% 30%;
+    --primary: 28 90% 55%;
+    /* #F5A623 — brand orange */
+    --primary-foreground: 0 0% 100%;
+    /* white on orange */
+    --secondary: 35 100% 96%;
+    /* #FFF8E8 light amber bg */
+    --secondary-foreground: 28 80% 35%;
+    --muted: 220 14% 94%;
+    /* #EDF2F7 light gray */
+    --muted-foreground: 220 10% 46%;
+    /* #6B7280 */
+    --accent: 28 90% 95%;
+    /* #FFF3E0 light orange */
+    --accent-foreground: 28 80% 30%;
+    --destructive: 0 72% 51%;
+    /* #EF4444 */
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 90%;
+    /* #E2E8F0 */
+    --input: 220 13% 90%;
+    --ring: 28 90% 55%;
+    /* brand orange ring */
+    --radius: 0.75rem;
+
+    /* ─── Brand palette tokens ─── */
+    --brand-orange: 28 90% 55%;
+    --brand-red: 6 78% 57%;
+    --brand-gradient: linear-gradient(135deg, hsl(28, 90%, 55%), hsl(6, 78%, 57%));
+
+    /* ─── UI Enhancement Tokens ─── */
+    --glass-bg: 0 0% 100% / 0.7;
+    --glass-border: 0 0% 100% / 0.5;
+    --shadow-soft: 0 8px 30px rgba(0, 0, 0, 0.04);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* ═══ Component overrides for Bright Premium UI ═══ */
+
+.kpi-card {
+  @apply rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm transition-all duration-300 hover:shadow-lg hover:shadow-slate-200/30 hover:-translate-y-0.5;
+}
+
+.glass-panel {
+  @apply rounded-2xl border border-slate-200/80 bg-white shadow-sm;
+}
+
+.section-header {
+  @apply mb-4 flex items-center gap-2 text-lg font-bold text-slate-800 tracking-tight;
+}
+
+/* Brand gradient text */
+.brand-gradient-text {
+  background: var(--brand-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Glow effects for light theme */
+.glow-primary {
+  box-shadow: 0 0 20px hsla(28, 90%, 55%, 0.15);
+}
+
+.glow-emerald {
+  box-shadow: 0 0 20px hsla(142, 71%, 45%, 0.15);
+}
+
+.animate-in {
+  animation: fade-in 0.5s ease-out;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
