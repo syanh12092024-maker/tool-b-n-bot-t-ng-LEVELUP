@@ -613,8 +613,27 @@ export default function BroadcastTab() {
         refreshSchedules();
     };
 
-    // ✅ Auto-fire đã chuyển sang server (Vercel Cron /api/broadcast/cron)
-    // Client chỉ hiển thị trạng thái — schedule status sẽ tự cập nhật qua polling mỗi 60s
+    // ✅ Auto-fire: gọi cron endpoint mỗi 5 phút để tự bắn khi đến giờ
+    // Hoạt động cả local và Vercel (Vercel Cron cũng gọi endpoint này)
+    useEffect(() => {
+        const fireCron = async () => {
+            try {
+                const res = await fetch('/api/broadcast/cron');
+                const data = await res.json();
+                if (data.fired > 0) {
+                    console.log(`[auto-fire] 🔥 Fired ${data.fired} segments`, data.results);
+                    refreshSchedules();
+                }
+            } catch (err) {
+                console.error('[auto-fire] Error:', err);
+            }
+        };
+        // Fire immediately on mount
+        fireCron();
+        // Then every 5 minutes
+        const interval = setInterval(fireCron, 5 * 60 * 1000);
+        return () => clearInterval(interval);
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     const startEditNote = (s: BroadcastSchedule) => {
         setEditingScheduleId(s.id);
@@ -1280,7 +1299,7 @@ export default function BroadcastTab() {
                                     </div>
                                     <button
                                         onClick={handleScheduleAll}
-                                        disabled={selectedIds.size === 0 || messages.every(m => !m?.trim())}
+                                        disabled={(!selectedShopId && !selectedPageId) || messages.every(m => !m?.trim())}
                                         className="w-full rounded-lg px-3 py-2.5 text-center transition-all border-2 border-amber-400 bg-gradient-to-r from-amber-500 to-orange-400 text-white shadow-md shadow-amber-200 hover:shadow-amber-300 font-bold text-sm disabled:opacity-40 disabled:cursor-not-allowed"
                                     >
                                         ⏰ Hẹn lịch ({messages.filter(m => m?.trim()).length} đoạn)

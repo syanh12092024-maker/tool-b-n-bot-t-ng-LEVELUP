@@ -1,4 +1,5 @@
-import { bigquery, BQ_DATASET, ensureDataset } from "../client";
+import fs from "fs";
+import path from "path";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 export interface ScheduleSegment {
@@ -31,68 +32,55 @@ export interface BroadcastSchedule {
     firedDates?: string[];
 }
 
-const TABLE = `${BQ_DATASET}.broadcast_schedules`;
+// ─── Local JSON file storage ──────────────────────────────────────────────────
+const DATA_DIR = path.join(process.cwd(), "data");
+const SCHEDULES_FILE = path.join(DATA_DIR, "broadcast-schedules.json");
 
-// ─── Ensure table exists ──────────────────────────────────────────────────────
-let tableReady = false;
-
-async function ensureTable() {
-    if (tableReady) return;
-    try {
-        await ensureDataset();
-        const query = `
-            CREATE TABLE IF NOT EXISTS \`${TABLE}\` (
-                id STRING NOT NULL,
-                schedule_json STRING NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
-            )
-        `;
-        await bigquery.query({ query });
-        tableReady = true;
-        console.log("[schedule-model] Table ready:", TABLE);
-    } catch (err) {
-        console.error("[schedule-model] ensureTable error:", err);
-        throw err;
+function ensureDataDir() {
+    if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+        console.log("[schedule-local] Created data directory:", DATA_DIR);
     }
+}
+
+function readSchedulesFile(): BroadcastSchedule[] {
+    ensureDataDir();
+    try {
+        if (fs.existsSync(SCHEDULES_FILE)) {
+            const raw = fs.readFileSync(SCHEDULES_FILE, "utf-8");
+            return JSON.parse(raw);
+        }
+    } catch (err) {
+        console.error("[schedule-local] Read error:", err);
+    }
+    return [];
+}
+
+function writeSchedulesFile(schedules: BroadcastSchedule[]) {
+    ensureDataDir();
+    fs.writeFileSync(SCHEDULES_FILE, JSON.stringify(schedules, null, 2), "utf-8");
 }
 
 // ─── Load all schedules ───────────────────────────────────────────────────────
 export async function loadSchedules(): Promise<BroadcastSchedule[]> {
-    await ensureTable();
-    try {
-        const [rows] = await bigquery.query({
-            query: `SELECT id, schedule_json FROM \`${TABLE}\` ORDER BY updated_at DESC`,
-        });
-        return rows.map((r: { schedule_json: string }) => JSON.parse(r.schedule_json));
-    } catch (err) {
-        console.error("[schedule-model] loadSchedules error:", err);
-        return [];
-    }
+    return readSchedulesFile();
 }
 
 // ─── Save (upsert) a single schedule ──────────────────────────────────────────
 export async function saveSchedule(schedule: BroadcastSchedule): Promise<void> {
-    await ensureTable();
-    const json = JSON.stringify(schedule);
-    // MERGE = upsert
-    const query = `
-        MERGE \`${TABLE}\` T
-        USING (SELECT @id AS id, @json AS schedule_json) S
-        ON T.id = S.id
-        WHEN MATCHED THEN
-            UPDATE SET schedule_json = S.schedule_json, updated_at = CURRENT_TIMESTAMP()
-        WHEN NOT MATCHED THEN
-            INSERT (id, schedule_json, updated_at) VALUES (S.id, S.schedule_json, CURRENT_TIMESTAMP())
-    `;
-    await bigquery.query({
-        query,
-        params: { id: schedule.id, json },
-    });
+    const schedules = readSchedulesFile();
+    const idx = schedules.findIndex(s => s.id === schedule.id);
+    if (idx >= 0) {
+        schedules[idx] = schedule;
+    } else {
+        schedules.push(schedule);
+    }
+    writeSchedulesFile(schedules);
+    console.log(`[schedule-local] Saved schedule ${schedule.id}`);
 }
 
 // ─── Save multiple schedules at once ──────────────────────────────────────────
 export async function saveSchedules(schedules: BroadcastSchedule[]): Promise<void> {
-    // Simple approach: save each one (BQ MERGE is idempotent)
     for (const s of schedules) {
         await saveSchedule(s);
     }
@@ -100,15 +88,14 @@ export async function saveSchedules(schedules: BroadcastSchedule[]): Promise<voi
 
 // ─── Delete a schedule ────────────────────────────────────────────────────────
 export async function deleteSchedule(id: string): Promise<void> {
-    await ensureTable();
-    await bigquery.query({
-        query: `DELETE FROM \`${TABLE}\` WHERE id = @id`,
-        params: { id },
-    });
+    const schedules = readSchedulesFile();
+    const filtered = schedules.filter(s => s.id !== id);
+    writeSchedulesFile(filtered);
+    console.log(`[schedule-local] Deleted schedule ${id}`);
 }
 
 // ─── Delete all schedules ─────────────────────────────────────────────────────
 export async function deleteAllSchedules(): Promise<void> {
-    await ensureTable();
-    await bigquery.query({ query: `TRUNCATE TABLE \`${TABLE}\`` });
+    writeSchedulesFile([]);
+    console.log("[schedule-local] Deleted all schedules");
 }
