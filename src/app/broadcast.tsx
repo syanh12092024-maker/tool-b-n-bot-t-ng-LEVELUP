@@ -6,7 +6,7 @@ import {
     Send, Users, RefreshCw, CheckCircle2, XCircle, Loader2,
     ChevronDown, Search, CheckSquare, Square, MessageSquare,
     AlertTriangle, ShoppingBag, Phone, ExternalLink, ImagePlus, X,
-    Clock, Timer, CalendarClock, Filter
+    Clock, Timer, CalendarClock, Filter, Pencil
 } from "lucide-react";
 
 // ─── Timezone mapping ─────────────────────────────────────────────────────────
@@ -107,9 +107,13 @@ interface ScheduleSegment {
     segIdx: number;   // 0-3
     hour: number;     // 6, 11, 17, 21
     message: string;
+    media?: string[];
     status?: SegmentStatus;
     error?: string;
     sentAt?: string;
+    totalRecipients?: number;
+    successCount?: number;
+    errorCount?: number;
 }
 
 interface BroadcastSchedule {
@@ -131,6 +135,7 @@ interface BroadcastSchedule {
     lastSegmentIndex?: number;
     lastRunDate?: string;
     firedDates?: string[];
+    recipientCount?: number;
 }
 
 // ─── API helpers (thay thế localStorage) ─────────────────────────────────────
@@ -387,6 +392,18 @@ export default function BroadcastTab() {
     const filteredCustomers = useMemo(() => {
         let result = customers;
 
+        // ═══ LUÔN loại khách tương tác trong vòng 24h (tránh bắn dồn dập) ═══
+        const now24h = Date.now();
+        const cutoff24h = now24h - 86400000; // 24h ago
+        const before24hFilter = result.length;
+        result = result.filter(c => {
+            const t = new Date(c.lastInteraction || c.updatedAt).getTime();
+            return t < cutoff24h; // chỉ giữ khách tương tác > 24h trước
+        });
+        if (result.length !== before24hFilter) {
+            console.log(`[filter] Loại ${before24hFilter - result.length} khách tương tác trong 24h (còn ${result.length})`);
+        }
+
         // ═══ LUÔN áp dụng purchase filter (không cần filterActive) ═══
         if (filterPurchase === 'no_purchase') {
             // Chưa mua = KHÔNG có SĐT VÀ orderCount = 0 VÀ KHÔNG có tag mua hàng
@@ -397,9 +414,9 @@ export default function BroadcastTab() {
         }
 
         // Các filter khác chỉ áp dụng khi filterActive
-        if (!filterActive && filterPurchase === 'all') return customers;
+        if (!filterActive && filterPurchase === 'all') return result;
 
-        // Time range filter
+        // Time range filter (optional, thêm lọc theo khoảng thời gian)
         if (filterTimeRange !== 'all') {
             const now = Date.now();
             const msMap: Record<string, number> = { '24h': 86400000, '7d': 604800000, '30d': 2592000000, '90d': 7776000000 };
@@ -541,7 +558,7 @@ export default function BroadcastTab() {
     // Đoạn 1 → 6h, Đoạn 2 → 11h, Đoạn 3 → 17h, Đoạn 4 → 21h
     const SEGMENT_HOUR_MAP = [6, 11, 17, 21];
 
-    const handleScheduleAll = () => {
+    const handleScheduleAll = async () => {
         if (!selectedShopId || !selectedPageId) {
             setScheduleToast("⚠️ Chọn Shop và Page trước!");
             setTimeout(() => setScheduleToast(null), 3000);
@@ -561,13 +578,95 @@ export default function BroadcastTab() {
         const pageName = pages.find(p => p.pageId === selectedPageId)?.name || selectedPageId;
         const tz = shopTz.offset;
 
+        // ═══ UPLOAD ẢNH TRƯỚC: chuyển base64 → URL để tránh vượt 1MB Firestore limit ═══
+        setScheduleToast("⏳ Đang upload ảnh...");
+        console.log('[schedule] filledSegments media:', filledSegments.map(s => ({ idx: s.idx, mediaCount: s.media.length, mediaPreview: s.media.map(m => m.substring(0, 30)) })));
+        
+        const uploadedSegments = await Promise.all(filledSegments.map(async (seg) => {
+            if (!seg.media || seg.media.length === 0) {
+                console.log(`[schedule] Seg ${seg.idx}: no media`);
+                return { ...seg, mediaUrls: [] as string[] };
+            }
+            
+            console.log(`[schedule] Seg ${seg.idx}: uploading ${seg.media.length} images...`);
+            const urls: string[] = [];
+            for (const dataUrl of seg.media) {
+                if (dataUrl.startsWith('http')) {
+                    // Already a URL (from edit mode), keep as-is
+                    urls.push(dataUrl);
+                    console.log(`[schedule] Seg ${seg.idx}: URL passthrough: ${dataUrl.substring(0, 60)}`);
+                    continue;
+                }
+                // base64 → upload to host
+                try {
+                    const match = dataUrl.match(/^data:[^;]+;base64,(.+)$/);
+                    if (!match) {
+                        console.warn(`[schedule] Seg ${seg.idx}: invalid data URL format: ${dataUrl.substring(0, 40)}`);
+                        continue;
+                    }
+                    const base64 = match[1];
+                    
+                    // Try freeimage.host first
+                    let uploadedUrl: string | null = null;
+                    try {
+                        const fd = new FormData();
+                        const blob = new Blob([Uint8Array.from(atob(base64), c => c.charCodeAt(0))], { type: 'image/png' });
+                        fd.append('source', blob, 'image.png');
+                        fd.append('type', 'file');
+                        fd.append('action', 'upload');
+                        const res = await fetch('https://freeimage.host/api/1/upload?key=6d207e02198a847aa98d0a2a901485a5', {
+                            method: 'POST', body: fd,
+                        });
+                        const data = await res.json();
+                        if (data?.image?.url) {
+                            uploadedUrl = data.image.url;
+                        } else {
+                            console.warn('[schedule] freeimage.host failed:', JSON.stringify(data).substring(0, 200));
+                        }
+                    } catch (err) {
+                        console.warn('[schedule] freeimage.host error:', err);
+                    }
+                    
+                    // Fallback: imgbb
+                    if (!uploadedUrl) {
+                        try {
+                            const fd2 = new FormData();
+                            fd2.append('image', base64);
+                            const res2 = await fetch('https://api.imgbb.com/1/upload?key=4e37bdbc3b6e2a84c28c47e0cce3e53f', {
+                                method: 'POST', body: fd2,
+                            });
+                            const data2 = await res2.json();
+                            if (data2?.data?.url) {
+                                uploadedUrl = data2.data.url;
+                                console.log('[schedule] imgbb fallback OK:', uploadedUrl);
+                            }
+                        } catch (err2) {
+                            console.error('[schedule] imgbb fallback error:', err2);
+                        }
+                    }
+                    
+                    if (uploadedUrl) {
+                        urls.push(uploadedUrl);
+                        console.log(`[schedule] Seg ${seg.idx}: ✅ uploaded: ${uploadedUrl}`);
+                    } else {
+                        console.error(`[schedule] Seg ${seg.idx}: ❌ ALL uploads failed`);
+                    }
+                } catch (err) {
+                    console.error('[schedule-upload] Error:', err);
+                }
+            }
+            console.log(`[schedule] Seg ${seg.idx}: ${urls.length} URLs ready`);
+            return { ...seg, mediaUrls: urls };
+        }));
+
         // ═══ TẠO 1 ENTRY DUY NHẤT chứa tất cả segments ═══
         const scheduleId = `${selectedShopId}_${selectedPageId}_combined`;
         const existing = schedules.find(s => s.id === scheduleId);
-        const segs: ScheduleSegment[] = filledSegments.map(seg => ({
+        const segs: ScheduleSegment[] = uploadedSegments.map(seg => ({
             segIdx: seg.idx,
             hour: SEGMENT_HOUR_MAP[seg.idx],
             message: seg.msg,
+            media: seg.mediaUrls || [],
         }));
         const firstHour = segs[0].hour;
 
@@ -587,6 +686,7 @@ export default function BroadcastTab() {
             lastFiredAt: existing?.lastFiredAt || null,
             nextFireAt: calcNextFireAt(firstHour, tz),
             note: existing?.note,
+            recipientCount: filteredCustomers.length,
         };
 
         setScheduledSegments(new Set(filledSegments.map(s => s.idx)));
@@ -644,6 +744,32 @@ export default function BroadcastTab() {
         await saveNoteAPI(id, editNote);
         refreshSchedules();
         setEditingScheduleId(null);
+    };
+
+    // ═══ SỬA NỘI DUNG: Load schedule vào 4 ô message + media ═══
+    const handleEditScheduleContent = (s: BroadcastSchedule) => {
+        // Load messages vào 4 ô
+        const msgs = s.messages || [];
+        setMsg1(msgs[0] || '');
+        setMsg2(msgs[1] || '');
+        setMsg3(msgs[2] || '');
+        setMsg4(msgs[3] || '');
+        
+        // Load media vào 4 ô
+        const segs = s.segments || [];
+        setMedia1(segs[0]?.media || []);
+        setMedia2(segs[1]?.media || []);
+        setMedia3(segs[2]?.media || []);
+        setMedia4(segs[3]?.media || []);
+        
+        // Select đúng shop + page
+        if (s.shopId && s.shopId !== selectedShopId) setSelectedShopId(s.shopId);
+        if (s.pageId && s.pageId !== selectedPageId) setSelectedPageId(s.pageId);
+        
+        // Scroll lên đầu
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        setScheduleToast(`✏️ Đang sửa lịch "${s.pageName}" — chỉnh sửa xong bấm "Hẹn lịch" để lưu`);
+        setTimeout(() => setScheduleToast(null), 5000);
     };
 
     const handleCancelSchedule = () => {
@@ -1409,6 +1535,74 @@ export default function BroadcastTab() {
                         </button>
                     </div>
 
+                    {/* ─── Stats Dashboard ───────────────────────────────────── */}
+                    {(() => {
+                        const allSegs = schedules.flatMap(s => s.segments || []);
+                        const totalSent = allSegs.reduce((a, seg) => a + (seg.successCount || 0), 0);
+                        const totalRecipients = allSegs.reduce((a, seg) => a + (seg.totalRecipients || 0), 0);
+                        const totalErrors = allSegs.reduce((a, seg) => a + (seg.errorCount || 0), 0);
+                        const successRate = totalRecipients > 0 ? ((totalSent / totalRecipients) * 100) : 0;
+                        const errorRate = totalRecipients > 0 ? ((totalErrors / totalRecipients) * 100) : 0;
+                        const activeCampaigns = schedules.filter(s => s.isActive).length;
+                        const totalDataQueued = schedules.reduce((a, s) => a + (s.recipientCount || 0), 0);
+
+                        return (
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-2">
+                                {/* Card 1: Tổng tin đã gửi */}
+                                <div className="bg-white rounded-xl border border-slate-100 p-3 shadow-sm">
+                                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Tổng tin đã gửi</p>
+                                    <div className="flex items-end gap-2">
+                                        <span className="text-2xl font-bold text-slate-800">{totalSent.toLocaleString()}</span>
+                                        {totalRecipients > 0 && (
+                                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 ${
+                                                successRate >= 70 ? 'bg-green-50 text-green-600' : 'bg-amber-50 text-amber-600'
+                                            }`}>
+                                                {successRate >= 70 ? '↗' : '↘'}{successRate.toFixed(0)}%
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+                                {/* Card 2: Data chờ bắn */}
+                                <div className="bg-white rounded-xl border border-slate-100 p-3 shadow-sm">
+                                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Data chờ bắn</p>
+                                    <div className="flex items-end gap-2">
+                                        <span className="text-2xl font-bold text-slate-800">{totalDataQueued.toLocaleString()}</span>
+                                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 bg-indigo-50 text-indigo-600">
+                                            👥 {schedules.length} page
+                                        </span>
+                                    </div>
+                                </div>
+                                {/* Card 3: Chiến dịch đang chạy */}
+                                <div className="bg-white rounded-xl border border-slate-100 p-3 shadow-sm">
+                                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Chiến dịch chạy</p>
+                                    <div className="flex items-end gap-2">
+                                        <span className="text-2xl font-bold text-slate-800">{activeCampaigns}</span>
+                                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 bg-green-50 text-green-600">
+                                            Active
+                                        </span>
+                                    </div>
+                                </div>
+                                {/* Card 4: Tỷ lệ lỗi */}
+                                <div className="bg-white rounded-xl border border-slate-100 p-3 shadow-sm">
+                                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Tỷ lệ lỗi</p>
+                                    <div className="flex items-end gap-2">
+                                        <span className="text-2xl font-bold text-slate-800">{errorRate.toFixed(2)}%</span>
+                                        {totalErrors > 0 && (
+                                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 bg-red-50 text-red-500">
+                                                ↗{totalErrors}
+                                            </span>
+                                        )}
+                                        {totalErrors === 0 && totalRecipients > 0 && (
+                                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 bg-green-50 text-green-600">
+                                                ✓ Clean
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })()}
+
                     {schedules.map(s => {
                         const tz = SHOP_TIMEZONES[s.shopName];
                         const nextMs = s.nextFireAt ? new Date(s.nextFireAt).getTime() - Date.now() : null;
@@ -1436,6 +1630,9 @@ export default function BroadcastTab() {
                                         <button onClick={() => startEditNote(s)} className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold bg-blue-50 text-blue-500 hover:bg-blue-100 transition-colors">
                                             <MessageSquare className="h-3 w-3" /> Ghi chú
                                         </button>
+                                        <button onClick={() => handleEditScheduleContent(s)} className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold bg-amber-50 text-amber-600 hover:bg-amber-100 transition-colors">
+                                            <Pencil className="h-3 w-3" /> Sửa
+                                        </button>
                                         <button onClick={() => handleDeleteSchedule(s.id)} className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold bg-red-50 text-red-400 hover:bg-red-100 transition-colors">
                                             <X className="h-3 w-3" /> Xoá
                                         </button>
@@ -1450,6 +1647,11 @@ export default function BroadcastTab() {
                                             }`}>
                                                 {s.isActive ? "● Đang chạy" : "⏸ Tạm dừng"}
                                             </span>
+                                            {s.recipientCount != null && (
+                                                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-600">
+                                                    👥 {s.recipientCount} data
+                                                </span>
+                                            )}
                                         </div>
                                         <div className="flex items-center gap-2 mt-0.5 flex-wrap">
                                             <span className="text-[11px] text-violet-600 font-semibold">
@@ -1499,7 +1701,7 @@ export default function BroadcastTab() {
                                                         <div
                                                             key={slot.idx}
                                                             title={seg?.error || ''}
-                                                            className={`flex-1 flex items-center justify-center gap-0.5 py-1 rounded-lg text-[10px] font-semibold transition-all ${
+                                                            className={`flex-1 flex flex-col items-center justify-center gap-0 py-1 rounded-lg text-[10px] font-semibold transition-all ${
                                                                 !isScheduled
                                                                     ? "bg-slate-50 text-slate-300 border border-slate-100"
                                                                     : status === 'sent'
@@ -1511,16 +1713,33 @@ export default function BroadcastTab() {
                                                                     : "bg-yellow-50 text-yellow-700 border border-yellow-200"
                                                             }`}
                                                         >
-                                                            <span>{slot.icon}</span>
-                                                            <span>{slot.time}</span>
-                                                            {!isScheduled && <span>—</span>}
-                                                            {isScheduled && status === 'sent' && <span>✓</span>}
-                                                            {isScheduled && status === 'error' && <span>✗</span>}
-                                                            {isScheduled && status === 'sending' && <span>⚡</span>}
-                                                            {isScheduled && status === 'pending' && <span>⏳</span>}
+                                                            <div className="flex items-center gap-0.5">
+                                                                <span>{slot.icon}</span>
+                                                                <span>{slot.time}</span>
+                                                                {!isScheduled && <span>—</span>}
+                                                                {isScheduled && status === 'sent' && <span>✓</span>}
+                                                                {isScheduled && status === 'error' && <span>✗</span>}
+                                                                {isScheduled && status === 'sending' && <span>⚡</span>}
+                                                                {isScheduled && status === 'pending' && <span>⏳</span>}
+                                                            </div>
+                                                            {isScheduled && seg?.totalRecipients != null && (
+                                                                <span className="text-[8px] opacity-70">
+                                                                    {seg.successCount ?? 0}/{seg.totalRecipients}
+                                                                </span>
+                                                            )}
                                                         </div>
                                                     );
                                                 })}
+                                            </div>
+                                            <div className="flex items-center gap-1.5">
+                                                <span className="text-[10px] text-slate-400">
+                                                    Tổng: <span className="font-semibold text-green-600">✅ {segs.reduce((a, seg) => a + (seg.successCount || 0), 0)}</span>
+                                                    <span className="text-slate-300 mx-0.5">/</span>
+                                                    <span className="font-semibold text-slate-500">{segs.reduce((a, seg) => a + (seg.totalRecipients || 0), 0)} data</span>
+                                                    {segs.some(seg => (seg.errorCount || 0) > 0) && (
+                                                        <span className="text-red-400 ml-1">❌ {segs.reduce((a, seg) => a + (seg.errorCount || 0), 0)} lỗi</span>
+                                                    )}
+                                                </span>
                                             </div>
                                             <div className="flex items-center gap-1.5">
                                                 <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden">

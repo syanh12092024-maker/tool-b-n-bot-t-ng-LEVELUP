@@ -25,3 +25,4 @@ npm-debug.log*
 
 # config secrets (keep config structure but not secrets)
 config/bigquery-key.json
+config/firestore-key.json

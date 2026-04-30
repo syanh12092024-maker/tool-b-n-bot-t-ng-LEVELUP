@@ -4,7 +4,7 @@ import {
     saveSchedule,
     type BroadcastSchedule,
     type ScheduleSegment,
-} from "@/lib/bigquery/models/talpha-schedule.model";
+} from "@/lib/firestore/schedule.model";
 
 // ─── Timezone mapping (same as broadcast-tab) ─────────────────────────────────
 const SHOP_TIMEZONES: Record<string, number> = {
@@ -49,6 +49,8 @@ interface Customer {
     pageFbId: string;
     orderCount: number;
     tags: (string | number)[];
+    updatedAt?: string;
+    lastInteraction?: string;
 }
 
 // ─── CRON HANDLER ─────────────────────────────────────────────────────────────
@@ -113,8 +115,8 @@ export async function GET(req: NextRequest) {
             log(`🏪 ${schedule.shopName} | Page: ${schedule.pageName} | TZ: UTC+${tz} | Now: ${currentDecimal.toFixed(2)}h | Today: ${todayStr}`);
 
             for (const seg of schedule.segments) {
-                // Reset status if new day
-                if (schedule.lastRunDate && schedule.lastRunDate !== todayStr) {
+                // Reset status if new day (or no lastRunDate yet)
+                if (!schedule.lastRunDate || schedule.lastRunDate !== todayStr) {
                     seg.status = "pending";
                     seg.error = undefined;
                     seg.sentAt = undefined;
@@ -125,14 +127,33 @@ export async function GET(req: NextRequest) {
                     log(`  ✅ Seg ${seg.segIdx} (${seg.hour}h) already sent today`);
                     continue;
                 }
-                // Skip currently sending (race condition guard)
+                // Skip currently sending — BUT reset if stuck > 30 minutes
                 if (seg.status === "sending") {
-                    log(`  ⏳ Seg ${seg.segIdx} (${seg.hour}h) currently sending, skip`);
-                    continue;
+                    const sentTime = seg.sentAt ? new Date(seg.sentAt).getTime() : 0;
+                    const stuckMinutes = sentTime ? (Date.now() - sentTime) / 60000 : 999;
+                    if (stuckMinutes < 30) {
+                        log(`  ⏳ Seg ${seg.segIdx} (${seg.hour}h) currently sending (${stuckMinutes.toFixed(0)}m), skip`);
+                        continue;
+                    }
+                    log(`  🔄 Seg ${seg.segIdx} (${seg.hour}h) was stuck in 'sending' for ${stuckMinutes.toFixed(0)}m — resetting`);
+                    seg.status = "pending";
                 }
 
                 // Check if it's time to fire
+                // Chỉ bắn nếu đúng giờ (trong khoảng 30 phút sau giờ hẹn)
+                // VD: seg 6h → bắn từ 6:00–6:30, sau 6:30 → skip (đã qua quá lâu)
+                const hoursPast = currentDecimal - seg.hour;
                 if (currentDecimal >= seg.hour && seg.status !== "sent") {
+                    if (hoursPast > 0.5) {
+                        // Đã qua quá 30 phút → skip, đánh dấu skipped
+                        log(`  ⏭️ Seg ${seg.segIdx} (${seg.hour}h) SKIPPED — đã qua ${(hoursPast * 60).toFixed(0)} phút (quá 30 phút)`);
+                        seg.status = "sent"; // đánh dấu để không bắn lại
+                        seg.error = `Bỏ qua — quá giờ ${(hoursPast * 60).toFixed(0)} phút`;
+                        schedule.lastRunDate = todayStr;
+                        await saveSchedule(schedule);
+                        continue;
+                    }
+
                     log(`  🔥 FIRING Seg ${seg.segIdx} (${seg.hour}h) — current time ${currentDecimal.toFixed(2)}h`);
 
                     seg.status = "sending";
@@ -191,7 +212,7 @@ async function fireSegment(
     // 1. Fetch customers for this shop+page
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL
         || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null)
-        || "https://talpha-dashboard.vercel.app";
+        || "http://localhost:3000";
 
     const custUrl = `${baseUrl}/api/broadcast?shopId=${schedule.shopId}&pageFilter=${schedule.pageId}`;
     log(`  📡 Fetching customers: ${custUrl.replace(/api_key=[^&]+/, "api_key=***")}`);
@@ -213,6 +234,20 @@ async function fireSegment(
     } else if (schedule.filterPurchase === "has_purchase") {
         allCust = allCust.filter((c) => c.customerPhone || c.orderCount > 0);
         log(`  🔍 After has_purchase filter: ${allCust.length}`);
+    }
+
+    // 2b. Filter: bỏ khách tương tác trong vòng 1 ngày
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const beforeTimeFilter = allCust.length;
+    allCust = allCust.filter((c) => {
+        const lastDate = c.lastInteraction || c.updatedAt;
+        if (!lastDate) return true; // không có ngày → giữ lại
+        const ts = new Date(lastDate).getTime();
+        if (isNaN(ts)) return true; // ngày không hợp lệ → giữ lại
+        return ts < oneDayAgo; // chỉ giữ khách tương tác > 1 ngày trước
+    });
+    if (beforeTimeFilter !== allCust.length) {
+        log(`  🕐 After 24h filter: ${allCust.length} (removed ${beforeTimeFilter - allCust.length} recent)`);
     }
 
     const recipients = allCust.map((c) => ({
@@ -239,15 +274,62 @@ async function fireSegment(
         
         const promises = batch.map(async (recipient) => {
             try {
-                const res = await fetch(`${baseUrl}/api/broadcast`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        recipients: [recipient],
-                        message: seg.message,
-                        forceGraphAPI: false, // fallback to Pancake CRM API because Talpha Bot app was deleted
-                    }),
-                });
+                const hasMedia = seg.media && seg.media.length > 0;
+                let res;
+
+                if (hasMedia) {
+                    // Check if media are URLs or base64
+                    const isUrl = seg.media![0]?.startsWith('http');
+                    
+                    if (isUrl) {
+                        // Media are URLs — send via JSON with images array
+                        res = await fetch(`${baseUrl}/api/broadcast`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                recipients: [recipient],
+                                message: seg.message?.trim() || "",
+                                images: seg.media,
+                                forceGraphAPI: false,
+                            }),
+                        });
+                    } else {
+                        // Media are base64 — use FormData
+                        const formData = new FormData();
+                        formData.append("recipients", JSON.stringify([recipient]));
+                        if (seg.message?.trim()) formData.append("message", seg.message.trim());
+                        formData.append("forceGraphAPI", "false");
+
+                        for (const dataUrl of seg.media!) {
+                            const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+                            if (match) {
+                                const mimeType = match[1];
+                                const base64 = match[2];
+                                const buffer = Buffer.from(base64, "base64");
+                                const blob = new Blob([buffer], { type: mimeType });
+                                const ext = mimeType.split("/")[1] || "png";
+                                formData.append("images", blob, `image.${ext}`);
+                            }
+                        }
+
+                        res = await fetch(`${baseUrl}/api/broadcast`, {
+                            method: "POST",
+                            body: formData,
+                        });
+                    }
+                } else {
+                    // Text only — use JSON
+                    res = await fetch(`${baseUrl}/api/broadcast`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            recipients: [recipient],
+                            message: seg.message,
+                            forceGraphAPI: false,
+                        }),
+                    });
+                }
+
                 const data = await res.json();
                 if (data.results?.[0]?.success) return true;
                 if (i === 0) log(`  ❌ ${recipient.name}: ${data.results?.[0]?.error || "Unknown"}`);
@@ -269,7 +351,11 @@ async function fireSegment(
         }
     }
 
-    // 4. Update segment status
+    // 4. Update segment status + counts
+    seg.totalRecipients = recipients.length;
+    seg.successCount = successCount;
+    seg.errorCount = errorCount;
+    
     if (errorCount === 0) {
         seg.status = "sent";
         seg.sentAt = new Date().toISOString();

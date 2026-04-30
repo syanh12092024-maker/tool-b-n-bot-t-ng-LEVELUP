@@ -4,7 +4,7 @@ import {
     saveSchedule,
     deleteSchedule,
     type BroadcastSchedule,
-} from "@/lib/bigquery/models/talpha-schedule.model";
+} from "@/lib/firestore/schedule.model";
 
 // ─── GET: Lấy tất cả schedules từ BigQuery ───────────────────────────────────
 export async function GET() {
