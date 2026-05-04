@@ -1320,8 +1320,8 @@ async function uploadToImgBB(base64: string): Promise<string> {
 }
 
 // ═══ SERVER-SIDE DEDUP CACHE ═══
-// Chống gửi lặp: từ chối gửi cùng PSID + cùng message trong 2 phút
-const DEDUP_WINDOW_MS = 2 * 60 * 1000; // 2 phút
+// Chống gửi lặp: từ chối gửi cùng PSID + cùng message trong 10 phút
+const DEDUP_WINDOW_MS = 10 * 60 * 1000; // 10 phút (tăng từ 2 phút để chặn retry lặp)
 const sentCache = new Map<string, number>(); // psid -> timestamp
 
 function cleanupDedup() {
