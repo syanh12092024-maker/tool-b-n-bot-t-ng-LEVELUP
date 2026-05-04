@@ -1727,19 +1727,30 @@ export async function POST(req: NextRequest) {
                                         console.log(`[img] ✅ Pancake content_url img${imgIdx} for ${recipient.name}`);
                                         imgSent = true;
                                     } else {
-                                        // Fallback: gửi URL như tin nhắn (Pancake tự hiển thị ảnh)
-                                        const pancakeImgRes2 = await fetch(apiBase, {
-                                            method: "POST",
-                                            headers: { "Content-Type": "application/json" },
-                                            body: JSON.stringify({ 
-                                                action: "reply_inbox", 
-                                                message: imgUrl 
-                                            }),
-                                        });
-                                        const pancakeImgData2 = await pancakeImgRes2.json().catch(() => ({}));
-                                        if (pancakeImgData2.success) {
-                                            console.log(`[img] ✅ Pancake message-url img${imgIdx} for ${recipient.name}`);
-                                            imgSent = true;
+                                        console.warn(`[img] Pancake content_url failed:`, JSON.stringify(pancakeImgData).slice(0, 100));
+                                        // Fallback: Pancake binary file upload (multipart/form-data)
+                                        try {
+                                            const imgBuffer = await fetch(imgUrl).then(r => r.ok ? r.arrayBuffer() : null);
+                                            if (imgBuffer) {
+                                                const pancakeFd = new FormData();
+                                                pancakeFd.append('action', 'reply_inbox');
+                                                const blob = new Blob([imgBuffer], { type: 'image/png' });
+                                                pancakeFd.append('file', blob, 'image.png');
+                                                
+                                                const pancakeBinRes = await fetch(apiBase, {
+                                                    method: "POST",
+                                                    body: pancakeFd,
+                                                });
+                                                const pancakeBinData = await pancakeBinRes.json().catch(() => ({}));
+                                                if (pancakeBinData.success) {
+                                                    console.log(`[img] ✅ Pancake binary upload img${imgIdx} for ${recipient.name}`);
+                                                    imgSent = true;
+                                                } else {
+                                                    console.warn(`[img] Pancake binary upload failed:`, JSON.stringify(pancakeBinData).slice(0, 100));
+                                                }
+                                            }
+                                        } catch (binErr) {
+                                            console.warn(`[img] Pancake binary upload exception:`, binErr instanceof Error ? binErr.message : binErr);
                                         }
                                     }
                                 } catch (pancakeErr) {
@@ -1747,14 +1758,33 @@ export async function POST(req: NextRequest) {
                                 }
                             }
 
-                            // ═══ METHOD 2: FB Graph API URL attachment (fallback) ═══
+                            // ═══ METHOD 2: FB Graph API direct binary upload (fallback) ═══
                             if (!imgSent && fbPageToken) {
                                 try {
-                                    const fbUrlResult = await sendImageViaFacebookGraphAPI(recipient.psid, imgUrl, fbPageToken);
-                                    if (fbUrlResult.success) {
-                                        console.log(`[img] ✅ FB URL attachment img${imgIdx} for ${recipient.name}`);
-                                        sentVia = 'fb_graph_api';
-                                        imgSent = true;
+                                    // Download image and send as binary
+                                    const imgBuffer = await fetch(imgUrl).then(r => r.ok ? r.arrayBuffer() : null);
+                                    if (imgBuffer) {
+                                        const fbResult = await sendImageDirectViaFacebookGraphAPI(
+                                            recipient.psid,
+                                            Buffer.from(imgBuffer),
+                                            'image.png',
+                                            'image/png',
+                                            fbPageToken
+                                        );
+                                        if (fbResult.success) {
+                                            console.log(`[img] ✅ FB direct upload img${imgIdx} for ${recipient.name}`);
+                                            sentVia = 'fb_graph_api';
+                                            imgSent = true;
+                                        }
+                                    }
+                                    // Fallback: send URL attachment
+                                    if (!imgSent) {
+                                        const fbUrlResult = await sendImageViaFacebookGraphAPI(recipient.psid, imgUrl, fbPageToken);
+                                        if (fbUrlResult.success) {
+                                            console.log(`[img] ✅ FB URL attachment img${imgIdx} for ${recipient.name}`);
+                                            sentVia = 'fb_graph_api';
+                                            imgSent = true;
+                                        }
                                     }
                                 } catch { /* ignore */ }
                             }
