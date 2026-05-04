@@ -1225,10 +1225,41 @@ async function sendImageDirectViaFacebookGraphAPI(
 }
 
 // ─── Helper: Upload ảnh lên LOCAL SERVER (primary — tự host, không phụ thuộc dịch vụ ngoài) ─
-import { writeFileSync, mkdirSync, existsSync } from "fs";
+import { writeFileSync, mkdirSync, existsSync, readFileSync } from "fs";
 
 const UPLOAD_DIR = path.resolve(process.cwd(), "public/uploads");
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "http://139.180.131.21";
+
+// Đọc ảnh từ disk thay vì fetch HTTP (tránh deadlock khi server tự fetch chính nó)
+function readLocalImage(imgUrl: string): Buffer | null {
+    try {
+        // Nếu URL là local server → đọc trực tiếp từ disk
+        if (imgUrl.includes('/uploads/')) {
+            const filename = imgUrl.split('/uploads/').pop();
+            if (filename) {
+                const filePath = path.join(UPLOAD_DIR, filename);
+                if (existsSync(filePath)) {
+                    return readFileSync(filePath);
+                }
+            }
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+async function getImageBuffer(imgUrl: string): Promise<Buffer | null> {
+    // Thử đọc từ disk trước (nhanh, không deadlock)
+    const localBuf = readLocalImage(imgUrl);
+    if (localBuf) return localBuf;
+    // Nếu không phải local → fetch từ URL bên ngoài
+    try {
+        const res = await fetch(imgUrl);
+        if (res.ok) return Buffer.from(await res.arrayBuffer());
+    } catch { /* ignore */ }
+    return null;
+}
 
 async function uploadToLocalServer(base64: string): Promise<string> {
     try {
@@ -1730,7 +1761,7 @@ export async function POST(req: NextRequest) {
                                         console.warn(`[img] Pancake content_url failed:`, JSON.stringify(pancakeImgData).slice(0, 100));
                                         // Fallback: Pancake binary file upload (multipart/form-data)
                                         try {
-                                            const imgBuffer = await fetch(imgUrl).then(r => r.ok ? r.arrayBuffer() : null);
+                                            const imgBuffer = await getImageBuffer(imgUrl);
                                             if (imgBuffer) {
                                                 const pancakeFd = new FormData();
                                                 pancakeFd.append('action', 'reply_inbox');
@@ -1761,12 +1792,12 @@ export async function POST(req: NextRequest) {
                             // ═══ METHOD 2: FB Graph API direct binary upload (fallback) ═══
                             if (!imgSent && fbPageToken) {
                                 try {
-                                    // Download image and send as binary
-                                    const imgBuffer = await fetch(imgUrl).then(r => r.ok ? r.arrayBuffer() : null);
+                                    // Đọc ảnh từ disk (không fetch HTTP tránh deadlock)
+                                    const imgBuffer = await getImageBuffer(imgUrl);
                                     if (imgBuffer) {
                                         const fbResult = await sendImageDirectViaFacebookGraphAPI(
                                             recipient.psid,
-                                            Buffer.from(imgBuffer),
+                                            imgBuffer,
                                             'image.png',
                                             'image/png',
                                             fbPageToken
