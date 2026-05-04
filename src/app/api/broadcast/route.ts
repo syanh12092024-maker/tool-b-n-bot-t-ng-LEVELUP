@@ -1224,63 +1224,30 @@ async function sendImageDirectViaFacebookGraphAPI(
     return { success: false, error: "FB Image Direct: tất cả tags thất bại" };
 }
 
-// ─── Helper: Upload ảnh lên Google Cloud Storage (primary — ổn định) ─
-import { GoogleAuth } from "google-auth-library";
+// ─── Helper: Upload ảnh lên LOCAL SERVER (primary — tự host, không phụ thuộc dịch vụ ngoài) ─
+import { writeFileSync, mkdirSync, existsSync } from "fs";
 
-const GCS_BUCKET = "banbot-494807.firebasestorage.app";
-const GCS_KEY_PATH = path.resolve(process.cwd(), "config/firestore-key.json");
+const UPLOAD_DIR = path.resolve(process.cwd(), "public/uploads");
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "http://139.180.131.21";
 
-let gcsAuth: GoogleAuth | null = null;
-async function getGCSToken(): Promise<string> {
-    if (!gcsAuth) {
-        gcsAuth = new GoogleAuth({
-            keyFile: GCS_KEY_PATH,
-            scopes: ["https://www.googleapis.com/auth/devstorage.read_write"],
-        });
-    }
-    const client = await gcsAuth.getClient();
-    const token = await client.getAccessToken();
-    return token.token || "";
-}
-
-async function uploadToGCS(base64: string): Promise<string> {
+async function uploadToLocalServer(base64: string): Promise<string> {
     try {
-        const buffer = Buffer.from(base64, "base64");
-        const filename = `broadcast/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`;
-        const token = await getGCSToken();
-        
-        const uploadUrl = `https://storage.googleapis.com/upload/storage/v1/b/${GCS_BUCKET}/o?uploadType=media&name=${encodeURIComponent(filename)}`;
-        const res = await fetch(uploadUrl, {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${token}`,
-                "Content-Type": "image/png",
-            },
-            body: buffer,
-        });
-        
-        if (!res.ok) {
-            const errText = await res.text();
-            console.error("[upload] GCS error:", res.status, errText.slice(0, 200));
-            return "";
+        // Đảm bảo thư mục uploads tồn tại
+        if (!existsSync(UPLOAD_DIR)) {
+            mkdirSync(UPLOAD_DIR, { recursive: true });
         }
         
-        // Make the file public
-        const makePublicUrl = `https://storage.googleapis.com/storage/v1/b/${GCS_BUCKET}/o/${encodeURIComponent(filename)}?predefinedAcl=publicRead`;
-        await fetch(makePublicUrl, {
-            method: "PATCH",
-            headers: {
-                Authorization: `Bearer ${token}`,
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ acl: [{ entity: "allUsers", role: "READER" }] }),
-        }).catch(() => {}); // Ignore ACL errors — bucket might have uniform access
-
-        const publicUrl = `https://storage.googleapis.com/${GCS_BUCKET}/${filename}`;
-        console.log(`[upload] ✅ GCS uploaded: ${publicUrl}`);
+        const buffer = Buffer.from(base64, "base64");
+        const filename = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`;
+        const filePath = path.join(UPLOAD_DIR, filename);
+        
+        writeFileSync(filePath, buffer);
+        
+        const publicUrl = `${APP_URL}/uploads/${filename}`;
+        console.log(`[upload] ✅ Local saved: ${publicUrl}`);
         return publicUrl;
     } catch (err) {
-        console.error("[upload] GCS error:", err instanceof Error ? err.message : err);
+        console.error("[upload] Local save error:", err instanceof Error ? err.message : err);
         return "";
     }
 }
@@ -1353,8 +1320,8 @@ async function uploadImageOnce(base64: string): Promise<string> {
         return cached.url;
     }
     
-    // Primary: Google Cloud Storage (ổn định nhất)
-    let url = await uploadToGCS(base64);
+    // Primary: Lưu trực tiếp trên server (nhanh nhất, ổn định nhất)
+    let url = await uploadToLocalServer(base64);
     // Fallback 1: freeimage.host
     if (!url) url = await uploadToFreeImageHost(base64);
     // Fallback 2: imgbb
