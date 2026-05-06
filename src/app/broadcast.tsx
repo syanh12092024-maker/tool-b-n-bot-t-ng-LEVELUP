@@ -507,14 +507,15 @@ export default function BroadcastTab() {
         setMediaArrays[boxIdx](prev => prev.filter((_, i) => i !== mediaIdx));
     };
 
-    // Get shop timezone
-    const shopName = shops.find(s => s.shop_id === selectedShopId)?.name || "";
+    // Get shop timezone (derived from selected page's shopName)
+    const selectedPage = pages.find(p => p.pageId === selectedPageId);
+    const shopName = selectedPage?.shopName || shops.find(s => s.shop_id === selectedShopId)?.name || "";
     const shopTz = SHOP_TIMEZONES[shopName] || { offset: 3, label: "UTC+3", flag: "🌍" };
 
     // ─── Schedule actions ────────────────────────────────────────────────────
     const handleSchedule = (hour: number) => {
-        if (!selectedShopId || !selectedPageId) {
-            setScheduleToast("⚠️ Chọn Shop và Page trước!");
+        if (!selectedPageId) {
+            setScheduleToast("⚠️ Chọn Page trước!");
             setTimeout(() => setScheduleToast(null), 3000);
             return;
         }
@@ -559,8 +560,8 @@ export default function BroadcastTab() {
     const SEGMENT_HOUR_MAP = [6, 11, 17, 21];
 
     const handleScheduleAll = async () => {
-        if (!selectedShopId || !selectedPageId) {
-            setScheduleToast("⚠️ Chọn Shop và Page trước!");
+        if (!selectedPageId) {
+            setScheduleToast("⚠️ Chọn Page trước!");
             setTimeout(() => setScheduleToast(null), 3000);
             return;
         }
@@ -975,24 +976,6 @@ export default function BroadcastTab() {
             {/* ─── Single control row: Shop + Page + Filters + Button ─── */}
             <div className="flex items-end gap-2 flex-wrap">
 
-                {/* Shop */}
-                <div className="flex-shrink-0">
-                    <label className="text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-1 block">🏪 Chọn Shop</label>
-                    <div className="relative w-40">
-                        <select
-                            value={selectedShopId}
-                            onChange={(e) => { setSelectedShopId(e.target.value); loadPages(e.target.value); }}
-                            disabled={isLoadingShops}
-                            className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-700 appearance-none pr-8 focus:outline-none focus:ring-2 focus:ring-violet-400/30 shadow-sm truncate"
-                        >
-                            <option value="">— Chọn shop —</option>
-                            {shops.map((s) => (
-                                <option key={s.shop_id} value={s.shop_id}>{s.name}</option>
-                            ))}
-                        </select>
-                        <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 pointer-events-none" />
-                    </div>
-                </div>
 
                 {/* Page Selector */}
                 <div className="relative flex-1 min-w-[180px]">
