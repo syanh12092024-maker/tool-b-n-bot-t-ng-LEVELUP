@@ -1468,41 +1468,49 @@ export async function POST(req: NextRequest) {
         // Cleanup dedup cache
         cleanupDedup();
 
-        // ═══ PRE-UPLOAD: Upload ảnh 1 lần duy nhất, reuse URL cho tất cả recipients ═══
-        const preUploadedImageUrls: string[] = [];
+        // ═══ PRE-PROCESS: Chuyển ảnh thành Buffer để gửi trực tiếp qua FB Graph API ═══
+        // Gửi ảnh dạng binary attachment (hiện ảnh trực tiếp trong chat, KHÔNG phải link URL)
+        const imageBuffers: { buffer: Buffer; name: string; type: string }[] = [];
         if (hasImages) {
-            console.log(`[img-preupload] Pre-uploading ${imageFiles.length + imageStrings.length} images...`);
-            const startUpload = Date.now();
+            console.log(`[img] Preparing ${imageFiles.length + imageStrings.length} images as buffers for direct send...`);
             
-            // Convert all images to base64
-            const allBase64: string[] = [];
-            for (const f of imageFiles) {
+            for (let i = 0; i < imageFiles.length; i++) {
+                const f = imageFiles[i];
                 const arrBuf = await f.arrayBuffer();
-                allBase64.push(Buffer.from(arrBuf).toString('base64'));
+                const ext = f.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+                imageBuffers.push({
+                    buffer: Buffer.from(arrBuf),
+                    name: `image_${i}.${ext}`,
+                    type: f.type || 'image/png',
+                });
             }
             for (const s of imageStrings) {
-                if (s.startsWith('http')) {
-                    // Already a URL — use directly, no upload needed
-                    preUploadedImageUrls.push(s);
-                    console.log(`[img-preupload] ✅ URL passthrough: ${s}`);
-                } else if (s.startsWith('data:')) {
+                if (s.startsWith('data:')) {
                     const m = s.match(/^data:([^;]+);base64,(.+)$/);
-                    if (m) allBase64.push(m[2]);
+                    if (m) {
+                        const ext = m[1].split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+                        imageBuffers.push({
+                            buffer: Buffer.from(m[2], 'base64'),
+                            name: `image_${imageBuffers.length}.${ext}`,
+                            type: m[1],
+                        });
+                    }
+                } else if (s.startsWith('http')) {
+                    // Download URL to buffer
+                    try {
+                        const res = await fetch(s);
+                        if (res.ok) {
+                            imageBuffers.push({
+                                buffer: Buffer.from(await res.arrayBuffer()),
+                                name: `image_${imageBuffers.length}.png`,
+                                type: res.headers.get('content-type') || 'image/png',
+                            });
+                        }
+                    } catch { /* ignore */ }
                 }
             }
             
-            // Upload each base64 image once (with cache)
-            for (let i = 0; i < allBase64.length; i++) {
-                const url = await uploadImageOnce(allBase64[i]);
-                if (url) {
-                    preUploadedImageUrls.push(url);
-                    console.log(`[img-preupload] ✅ Image ${i}: ${url}`);
-                } else {
-                    console.warn(`[img-preupload] ❌ Failed to upload image ${i}`);
-                }
-            }
-            
-            console.log(`[img-preupload] Done: ${preUploadedImageUrls.length} URLs ready in ${Date.now() - startUpload}ms`);
+            console.log(`[img] Ready: ${imageBuffers.length} image buffers (sizes: ${imageBuffers.map(b => `${(b.buffer.length/1024).toFixed(0)}KB`).join(', ')})`);
         }
 
         // Create message fingerprint for dedup (different messages = different segments = OK)
@@ -1738,86 +1746,72 @@ export async function POST(req: NextRequest) {
                     }
                 }
 
-                // 2. Gửi hình ảnh — dùng URL đã pre-upload (nhanh, không upload lại)
-                if (preUploadedImageUrls.length > 0) {
-                    for (let imgIdx = 0; imgIdx < preUploadedImageUrls.length; imgIdx++) {
+                // 2. Gửi hình ảnh trực tiếp (hiện ảnh trong chat, KHÔNG phải link)
+                if (imageBuffers.length > 0) {
+                    for (let imgIdx = 0; imgIdx < imageBuffers.length; imgIdx++) {
                         try {
-                            const imgUrl = preUploadedImageUrls[imgIdx];
+                            const img = imageBuffers[imgIdx];
                             let imgSent = false;
                             
-                            // ═══ METHOD 1: Pancake content_url (nhanh nhất) ═══
-                            if (pageToken && !imgSent) {
+                            // ═══ METHOD 1 (PRIMARY): FB Graph API binary upload ═══
+                            // Gửi ảnh trực tiếp dạng attachment → hiện ảnh trong chat
+                            if (fbPageToken && !imgSent) {
                                 try {
-                                    const pancakeImgRes = await fetch(apiBase, {
-                                        method: "POST",
-                                        headers: { "Content-Type": "application/json" },
-                                        body: JSON.stringify({ 
-                                            action: "reply_inbox", 
-                                            content_url: imgUrl 
-                                        }),
-                                    });
-                                    const pancakeImgData = await pancakeImgRes.json().catch(() => ({}));
-                                    if (pancakeImgData.success) {
-                                        console.log(`[img] ✅ Pancake content_url img${imgIdx} for ${recipient.name}`);
+                                    console.log(`[img] Trying FB direct upload img${imgIdx} (${(img.buffer.length/1024).toFixed(0)}KB) for ${recipient.name}...`);
+                                    const fbResult = await sendImageDirectViaFacebookGraphAPI(
+                                        recipient.psid,
+                                        img.buffer,
+                                        img.name,
+                                        img.type,
+                                        fbPageToken
+                                    );
+                                    if (fbResult.success) {
+                                        console.log(`[img] ✅ FB direct upload img${imgIdx} for ${recipient.name}`);
+                                        sentVia = 'fb_graph_api';
                                         imgSent = true;
                                     } else {
-                                        console.warn(`[img] Pancake content_url failed:`, JSON.stringify(pancakeImgData).slice(0, 100));
-                                        // Fallback: Pancake binary file upload (multipart/form-data)
-                                        try {
-                                            const imgBuffer = await getImageBuffer(imgUrl);
-                                            if (imgBuffer) {
-                                                const pancakeFd = new FormData();
-                                                pancakeFd.append('action', 'reply_inbox');
-                                                const blob = new Blob([imgBuffer], { type: 'image/png' });
-                                                pancakeFd.append('file', blob, 'image.png');
-                                                
-                                                const pancakeBinRes = await fetch(apiBase, {
-                                                    method: "POST",
-                                                    body: pancakeFd,
-                                                });
-                                                const pancakeBinData = await pancakeBinRes.json().catch(() => ({}));
-                                                if (pancakeBinData.success) {
-                                                    console.log(`[img] ✅ Pancake binary upload img${imgIdx} for ${recipient.name}`);
-                                                    imgSent = true;
-                                                } else {
-                                                    console.warn(`[img] Pancake binary upload failed:`, JSON.stringify(pancakeBinData).slice(0, 100));
-                                                }
-                                            }
-                                        } catch (binErr) {
-                                            console.warn(`[img] Pancake binary upload exception:`, binErr instanceof Error ? binErr.message : binErr);
-                                        }
+                                        console.warn(`[img] FB direct upload failed img${imgIdx}: ${fbResult.error}`);
                                     }
-                                } catch (pancakeErr) {
-                                    console.warn(`[img] Pancake exception:`, pancakeErr instanceof Error ? pancakeErr.message : pancakeErr);
+                                } catch (fbErr) {
+                                    console.warn(`[img] FB direct exception:`, fbErr instanceof Error ? fbErr.message : fbErr);
                                 }
                             }
 
-                            // ═══ METHOD 2: FB Graph API direct binary upload (fallback) ═══
+                            // ═══ METHOD 2 (FALLBACK): FB Graph API URL attachment ═══
+                            // Upload ảnh lên hosting rồi gửi URL attachment
                             if (!imgSent && fbPageToken) {
                                 try {
-                                    // Đọc ảnh từ disk (không fetch HTTP tránh deadlock)
-                                    const imgBuffer = await getImageBuffer(imgUrl);
-                                    if (imgBuffer) {
-                                        const fbResult = await sendImageDirectViaFacebookGraphAPI(
-                                            recipient.psid,
-                                            imgBuffer,
-                                            'image.png',
-                                            'image/png',
-                                            fbPageToken
-                                        );
-                                        if (fbResult.success) {
-                                            console.log(`[img] ✅ FB direct upload img${imgIdx} for ${recipient.name}`);
-                                            sentVia = 'fb_graph_api';
-                                            imgSent = true;
-                                        }
-                                    }
-                                    // Fallback: send URL attachment
-                                    if (!imgSent) {
+                                    const imgUrl = await uploadImageOnce(img.buffer.toString('base64'));
+                                    if (imgUrl) {
+                                        console.log(`[img] Trying FB URL attachment img${imgIdx}: ${imgUrl}`);
                                         const fbUrlResult = await sendImageViaFacebookGraphAPI(recipient.psid, imgUrl, fbPageToken);
                                         if (fbUrlResult.success) {
                                             console.log(`[img] ✅ FB URL attachment img${imgIdx} for ${recipient.name}`);
                                             sentVia = 'fb_graph_api';
                                             imgSent = true;
+                                        } else {
+                                            console.warn(`[img] FB URL attachment failed: ${fbUrlResult.error}`);
+                                        }
+                                    }
+                                } catch { /* ignore */ }
+                            }
+                            
+                            // ═══ METHOD 3 (LAST RESORT): Pancake content_url ═══
+                            if (!imgSent && pageToken) {
+                                try {
+                                    const imgUrl = await uploadImageOnce(img.buffer.toString('base64'));
+                                    if (imgUrl) {
+                                        const pancakeImgRes = await fetch(apiBase, {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ action: "reply_inbox", content_url: imgUrl }),
+                                        });
+                                        const pancakeImgData = await pancakeImgRes.json().catch(() => ({}));
+                                        if (pancakeImgData.success) {
+                                            console.log(`[img] ✅ Pancake content_url img${imgIdx} for ${recipient.name}`);
+                                            imgSent = true;
+                                        } else {
+                                            console.warn(`[img] Pancake content_url failed:`, JSON.stringify(pancakeImgData).slice(0, 100));
                                         }
                                     }
                                 } catch { /* ignore */ }
@@ -1828,7 +1822,7 @@ export async function POST(req: NextRequest) {
                                 console.error(`[img] ❌ ALL methods failed for img${imgIdx} of ${recipient.name}`);
                             }
                             
-                            await new Promise(resolve => setTimeout(resolve, 200));
+                            await new Promise(resolve => setTimeout(resolve, 300));
                         } catch (imgErr) {
                             imageSuccess = false;
                             console.error(`[img] Exception img${imgIdx}:`, imgErr instanceof Error ? imgErr.message : imgErr);
