@@ -1228,7 +1228,8 @@ async function sendImageDirectViaFacebookGraphAPI(
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from "fs";
 
 const UPLOAD_DIR = path.resolve(process.cwd(), "public/uploads");
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "http://139.180.131.21";
+// PUBLIC_URL dùng cho ảnh upload — phải là URL mà Pancake/Facebook truy cập được (KHÔNG phải localhost)
+const APP_URL = process.env.PUBLIC_URL || "http://139.180.131.21:8089";
 
 // Đọc ảnh từ disk thay vì fetch HTTP (tránh deadlock khi server tự fetch chính nó)
 function readLocalImage(imgUrl: string): Buffer | null {
