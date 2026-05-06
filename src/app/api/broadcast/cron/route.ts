@@ -140,13 +140,13 @@ export async function GET(req: NextRequest) {
                 }
 
                 // Check if it's time to fire
-                // Chỉ bắn nếu đúng giờ (trong khoảng 30 phút sau giờ hẹn)
-                // VD: seg 6h → bắn từ 6:00–6:30, sau 6:30 → skip (đã qua quá lâu)
+                // Chỉ bắn nếu đúng giờ (trong khoảng 60 phút sau giờ hẹn)
+                // VD: seg 6h → bắn từ 6:00–7:00, sau 7:00 → skip (đã qua quá lâu)
                 const hoursPast = currentDecimal - seg.hour;
                 if (currentDecimal >= seg.hour && seg.status !== "sent") {
-                    if (hoursPast > 0.5) {
-                        // Đã qua quá 30 phút → skip, đánh dấu skipped
-                        log(`  ⏭️ Seg ${seg.segIdx} (${seg.hour}h) SKIPPED — đã qua ${(hoursPast * 60).toFixed(0)} phút (quá 30 phút)`);
+                    if (hoursPast > 1.0) {
+                        // Đã qua quá 60 phút → skip, đánh dấu skipped
+                        log(`  ⏭️ Seg ${seg.segIdx} (${seg.hour}h) SKIPPED — đã qua ${(hoursPast * 60).toFixed(0)} phút (quá 60 phút)`);
                         seg.status = "sent"; // đánh dấu để không bắn lại
                         seg.error = `Bỏ qua — quá giờ ${(hoursPast * 60).toFixed(0)} phút`;
                         schedule.lastRunDate = todayStr;
@@ -212,7 +212,7 @@ async function fireSegment(
     // 1. Fetch customers for this shop+page
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL
         || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null)
-        || "http://localhost:3000";
+        || "http://localhost:3001";
 
     const custUrl = `${baseUrl}/api/broadcast?shopId=${schedule.shopId}&pageFilter=${schedule.pageId}`;
     log(`  📡 Fetching customers: ${custUrl.replace(/api_key=[^&]+/, "api_key=***")}`);
