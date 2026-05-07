@@ -1889,6 +1889,27 @@ export async function POST(req: NextRequest) {
                             }
 
                             if (!imgSent) {
+                                // ═══ FALLBACK CUỐI: Gửi URL ảnh dạng text (FB auto-preview) ═══
+                                try {
+                                    const uploadUrl = await uploadImageOnce(file.buffer.toString('base64'));
+                                    if (uploadUrl) {
+                                        const fallbackRes = await fetch(apiBase, {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ action: "reply_inbox", message: uploadUrl }),
+                                        });
+                                        const fallbackData = await fallbackRes.json().catch(() => ({}));
+                                        if (fallbackData.success) {
+                                            console.log(`[img] ✅ URL-as-text fallback img${imgIdx} for ${recipient.name}`);
+                                            imgSent = true;
+                                        } else {
+                                            console.error(`[img] ❌ URL-as-text also failed for ${recipient.name}`);
+                                        }
+                                    }
+                                } catch { /* ignore */ }
+                            }
+
+                            if (!imgSent) {
                                 imageSuccess = false;
                                 console.error(`[img] ❌ ALL methods failed for img${imgIdx} of ${recipient.name}`);
                             }
