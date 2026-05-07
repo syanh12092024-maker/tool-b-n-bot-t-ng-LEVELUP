@@ -681,16 +681,21 @@ async function fetchCRMConversations(
     // Only try additional strategies if we hit the 500 cap
     if (batch1.conversations.length >= 500) {
         // ═══ STRATEGY 2: Cursor pagination (last_conversation_id) ═══
+        // Đây là cách chính để lấy HẾT data — lặp qua từng trang 500
         let cursor = batch1.conversations[batch1.conversations.length - 1]?.id;
         let cursorAttempts = 0;
-        const maxCursorPages = 20; // Tăng từ 10 → 20
+        const maxCursorPages = 100; // Tối đa 100 trang × 500 = 50,000 khách
         while (cursor && cursorAttempts < maxCursorPages) {
             const cursorBatch = await fetchCRMBatch(apiUrl, token, pageId, `&last_conversation_id=${cursor}`);
             const newFromCursor = addBatch(cursorBatch.conversations, `cursor_page_${cursorAttempts + 1}`);
             if (newFromCursor === 0 || cursorBatch.conversations.length === 0) break;
             cursor = cursorBatch.conversations[cursorBatch.conversations.length - 1]?.id;
             cursorAttempts++;
+            // Delay 200ms giữa các request tránh rate limit
+            await new Promise(r => setTimeout(r, 200));
         }
+        console.log(`[broadcast] Cursor pagination: ${cursorAttempts} pages, total ${allConversations.length} conversations`);
+
 
         // ═══ STRATEGY 3: Per-tag filtering ═══
         let tagList: Array<{ id: number; name: string }> = [];
