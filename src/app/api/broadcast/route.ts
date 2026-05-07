@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
 import yaml from "js-yaml";
+import sharp from "sharp";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface ShopConfig {
@@ -1510,7 +1511,40 @@ export async function POST(req: NextRequest) {
                 }
             }
             
-            console.log(`[img] Ready: ${imageBuffers.length} image buffers (sizes: ${imageBuffers.map(b => `${(b.buffer.length/1024).toFixed(0)}KB`).join(', ')})`);
+            console.log(`[img] Raw: ${imageBuffers.length} images (sizes: ${imageBuffers.map(b => `${(b.buffer.length/1024).toFixed(0)}KB`).join(', ')})`);
+            
+            // ═══ NÉN ẢNH: Giảm dung lượng ảnh lớn trước khi gửi ═══
+            const MAX_SIZE_KB = 200; // Ảnh > 200KB sẽ bị nén
+            const MAX_WIDTH = 1200;  // Resize max width
+            const JPEG_QUALITY = 75; // Chất lượng JPEG
+            
+            for (let i = 0; i < imageBuffers.length; i++) {
+                const img = imageBuffers[i];
+                const sizeKB = img.buffer.length / 1024;
+                
+                if (sizeKB > MAX_SIZE_KB) {
+                    try {
+                        console.log(`[img-compress] Nén ảnh ${i}: ${sizeKB.toFixed(0)}KB → ...`);
+                        const compressed = await sharp(img.buffer)
+                            .resize({ width: MAX_WIDTH, withoutEnlargement: true })
+                            .jpeg({ quality: JPEG_QUALITY, mozjpeg: true })
+                            .toBuffer();
+                        
+                        const newSizeKB = compressed.length / 1024;
+                        console.log(`[img-compress] ✅ Ảnh ${i}: ${sizeKB.toFixed(0)}KB → ${newSizeKB.toFixed(0)}KB (giảm ${((1 - newSizeKB/sizeKB) * 100).toFixed(0)}%)`);
+                        
+                        imageBuffers[i] = {
+                            buffer: compressed,
+                            name: img.name.replace(/\.[^.]+$/, '.jpg'),
+                            type: 'image/jpeg',
+                        };
+                    } catch (compErr) {
+                        console.warn(`[img-compress] ⚠️ Nén ảnh ${i} thất bại, giữ nguyên:`, compErr instanceof Error ? compErr.message : compErr);
+                    }
+                }
+            }
+            
+            console.log(`[img] Ready: ${imageBuffers.length} images (sizes: ${imageBuffers.map(b => `${(b.buffer.length/1024).toFixed(0)}KB`).join(', ')})`);
         }
 
         // Create message fingerprint for dedup (different messages = different segments = OK)
