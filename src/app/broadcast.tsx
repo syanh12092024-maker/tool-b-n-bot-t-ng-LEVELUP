@@ -800,6 +800,11 @@ export default function BroadcastTab() {
     const logScrollRef = useRef<HTMLDivElement>(null);
     const [sendDropdownOpen, setSendDropdownOpen] = useState(false);
     const [forceGraphAPI, setForceGraphAPI] = useState(false);
+    // ═══ AUTO-BATCH: Chia nhỏ recipients thành từng đợt ═══
+    const BATCH_SIZE = 50; // Mỗi đợt gửi 50 người
+    const BATCH_DELAY_SEC = 60; // Delay 60s giữa các đợt
+    const [autoBatchInfo, setAutoBatchInfo] = useState<{ currentBatch: number; totalBatches: number; totalSent: number; totalRecipients: number } | null>(null);
+    const [batchCountdown, setBatchCountdown] = useState(0); // Countdown giữa các đợt
 
     const handleSendBox = async (boxIdx: number) => {
         // ═══ NUCLEAR GUARD: window-level global flag ═══
@@ -842,71 +847,105 @@ export default function BroadcastTab() {
             // Ảnh gửi trực tiếp base64 — server sẽ convert → FormData → Pancake
             const imageData: string[] = boxMedia.length > 0 ? boxMedia : [];
 
-            // ── GỬI TỪNG NGƯỜI 1 — CLIENT LOOP ──
+            // ── GỬI TỪNG NGƯỜI 1 — CLIENT LOOP (AUTO-BATCH) ──
             const allResults: SendResult[] = [];
+
+            // Chia recipients thành batches
+            const batches: typeof allRecipients[] = [];
+            for (let i = 0; i < allRecipients.length; i += BATCH_SIZE) {
+                batches.push(allRecipients.slice(i, i + BATCH_SIZE));
+            }
 
             // Khởi tạo log cho tất cả recipients
             setSendingLog(allRecipients.map(r => ({ name: r.name, status: 'pending' as const })));
+            let globalIdx = 0; // index toàn cục across batches
 
-            for (let i = 0; i < allRecipients.length; i++) {
+            for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
                 if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
-                const recipient = allRecipients[i];
-                setBatchProgress({ sent: i, total: allRecipients.length });
+                const batch = batches[batchIdx];
+                setAutoBatchInfo({
+                    currentBatch: batchIdx + 1,
+                    totalBatches: batches.length,
+                    totalSent: globalIdx,
+                    totalRecipients: allRecipients.length,
+                });
 
-                // Mark current as 'sending'
-                setSendingLog(prev => prev.map((item, idx) => idx === i ? { ...item, status: 'sending' as const } : item));
-                // Auto-scroll
-                setTimeout(() => logScrollRef.current?.scrollTo({ top: logScrollRef.current.scrollHeight, behavior: 'smooth' }), 50);
+                // ── Gửi từng người trong batch ──
+                for (let j = 0; j < batch.length; j++) {
+                    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
-                try {
-                    let res: Response;
-                    if (imageData.length > 0) {
-                        // Gửi FormData để tránh Vercel JSON body limit 4.5MB
-                        const fd = new FormData();
-                        fd.append('recipients', JSON.stringify([recipient]));
-                        fd.append('message', msg || '');
-                        // Convert base64 data URLs → Blob → File
-                        for (let imgIdx = 0; imgIdx < imageData.length; imgIdx++) {
-                            const imgStr = imageData[imgIdx];
-                            if (imgStr.startsWith('data:')) {
-                                const resp = await fetch(imgStr);
-                                const blob = await resp.blob();
-                                const ext = blob.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
-                                fd.append('images', new File([blob], `img_${imgIdx}.${ext}`, { type: blob.type }));
+                    const recipient = batch[j];
+                    setBatchProgress({ sent: globalIdx, total: allRecipients.length });
+
+                    // Mark current as 'sending'
+                    setSendingLog(prev => prev.map((item, idx) => idx === globalIdx ? { ...item, status: 'sending' as const } : item));
+                    setTimeout(() => logScrollRef.current?.scrollTo({ top: logScrollRef.current.scrollHeight, behavior: 'smooth' }), 50);
+
+                    try {
+                        let res: Response;
+                        if (imageData.length > 0) {
+                            const fd = new FormData();
+                            fd.append('recipients', JSON.stringify([recipient]));
+                            fd.append('message', msg || '');
+                            for (let imgIdx = 0; imgIdx < imageData.length; imgIdx++) {
+                                const imgStr = imageData[imgIdx];
+                                if (imgStr.startsWith('data:')) {
+                                    const resp = await fetch(imgStr);
+                                    const blob = await resp.blob();
+                                    const ext = blob.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+                                    fd.append('images', new File([blob], `img_${imgIdx}.${ext}`, { type: blob.type }));
+                                }
                             }
+                            if (forceGraphAPI) fd.append('forceGraphAPI', 'true');
+                            res = await fetch("/api/broadcast", { method: "POST", body: fd, signal });
+                        } else {
+                            res = await fetch("/api/broadcast", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ recipients: [recipient], message: msg || '', forceGraphAPI }),
+                                signal,
+                            });
                         }
-                        if (forceGraphAPI) fd.append('forceGraphAPI', 'true');
-                        res = await fetch("/api/broadcast", { method: "POST", body: fd, signal });
-                    } else {
-                        res = await fetch("/api/broadcast", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ recipients: [recipient], message: msg || '', forceGraphAPI }),
-                            signal,
-                        });
+                        const data = await res.json();
+                        if (data.results && data.results.length > 0) {
+                            allResults.push(...data.results);
+                            const ok = data.results[0]?.success;
+                            const capturedIdx = globalIdx;
+                            setSendingLog(prev => prev.map((item, idx) => idx === capturedIdx ? { ...item, status: ok ? 'success' as const : 'error' as const, error: data.results[0]?.error } : item));
+                        } else if (data.error) {
+                            allResults.push({ psid: recipient.psid, name: recipient.name, success: false, error: data.error });
+                            const capturedIdx = globalIdx;
+                            setSendingLog(prev => prev.map((item, idx) => idx === capturedIdx ? { ...item, status: 'error' as const, error: data.error } : item));
+                        }
+                    } catch (err) {
+                        if (err instanceof Error && err.name === 'AbortError') throw err;
+                        allResults.push({ psid: recipient.psid, name: recipient.name, success: false, error: "Network error" });
+                        const capturedIdx = globalIdx;
+                        setSendingLog(prev => prev.map((item, idx) => idx === capturedIdx ? { ...item, status: 'error' as const, error: 'Network error' } : item));
                     }
-                    const data = await res.json();
-                    if (data.results && data.results.length > 0) {
-                        allResults.push(...data.results);
-                        const ok = data.results[0]?.success;
-                        setSendingLog(prev => prev.map((item, idx) => idx === i ? { ...item, status: ok ? 'success' as const : 'error' as const, error: data.results[0]?.error } : item));
-                    } else if (data.error) {
-                        allResults.push({ psid: recipient.psid, name: recipient.name, success: false, error: data.error });
-                        setSendingLog(prev => prev.map((item, idx) => idx === i ? { ...item, status: 'error' as const, error: data.error } : item));
+
+                    globalIdx++;
+                    if (j < batch.length - 1) {
+                        await new Promise(resolve => setTimeout(resolve, 300));
                     }
-                } catch (err) {
-                    if (err instanceof Error && err.name === 'AbortError') throw err;
-                    allResults.push({ psid: recipient.psid, name: recipient.name, success: false, error: "Network error" });
-                    setSendingLog(prev => prev.map((item, idx) => idx === i ? { ...item, status: 'error' as const, error: 'Network error' } : item));
                 }
 
-                if (i < allRecipients.length - 1) {
-                    await new Promise(resolve => setTimeout(resolve, 300));
+                // ── Delay giữa các batch (trừ batch cuối) ──
+                if (batchIdx < batches.length - 1) {
+                    setAutoBatchInfo(prev => prev ? { ...prev, totalSent: globalIdx } : null);
+                    // Countdown delay
+                    for (let sec = BATCH_DELAY_SEC; sec > 0; sec--) {
+                        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+                        setBatchCountdown(sec);
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                    }
+                    setBatchCountdown(0);
                 }
             }
 
             setBatchProgress({ sent: allRecipients.length, total: allRecipients.length });
+            setAutoBatchInfo(prev => prev ? { ...prev, totalSent: allRecipients.length } : null);
             setSendResults(allResults);
 
         } catch (err: unknown) {
@@ -924,6 +963,8 @@ export default function BroadcastTab() {
             lastSentTimeRef.current = Date.now(); // Start 10s cooldown
             // GIỮ batchProgress ở sent=total để thanh bar hiển thị 100% xanh lá
             abortControllerRef.current = null;
+            setAutoBatchInfo(null);
+            setBatchCountdown(0);
         }
     };
 
@@ -1423,8 +1464,10 @@ export default function BroadcastTab() {
                     <div className="border-t border-amber-200/60 pt-3 space-y-2">
                         <div className="flex items-center justify-between text-sm font-semibold">
                             <span className="text-blue-700 flex items-center gap-1.5">
-                                {batchProgress && batchProgress.sent < batchProgress.total ? (
-                                    <><span className="animate-pulse">📡</span> Đang gửi...</>
+                                {batchCountdown > 0 ? (
+                                    <><span className="animate-pulse">⏸️</span> Nghỉ giữa đợt... ({batchCountdown}s)</>
+                                ) : batchProgress && batchProgress.sent < batchProgress.total ? (
+                                    <><span className="animate-pulse">📡</span> Đang gửi...{autoBatchInfo ? ` (Đợt ${autoBatchInfo.currentBatch}/${autoBatchInfo.totalBatches})` : ''}</>
                                 ) : sendingLog.length > 0 && sendingLog.every(l => l.status === 'success' || l.status === 'error') ? (
                                     <>✅ Hoàn tất</>
                                 ) : (
