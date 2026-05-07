@@ -1352,12 +1352,12 @@ async function uploadImageOnce(base64: string): Promise<string> {
         return cached.url;
     }
     
-    // Primary: freeimage.host (public URL, không cần self-host)
-    let url = await uploadToFreeImageHost(base64);
-    // Fallback: imgbb
+    // Primary: local server (nginx serve static - đã hoạt động trước đây!)
+    let url = await uploadToLocalServer(base64);
+    // Fallback 1: freeimage.host
+    if (!url) url = await uploadToFreeImageHost(base64);
+    // Fallback 2: imgbb
     if (!url) url = await uploadToImgBB(base64);
-    // Last resort: local server (chỉ work nếu có custom static serve)
-    if (!url) url = await uploadToLocalServer(base64);
     
     if (url) {
         imageUrlCache.set(hash, { url, ts: Date.now() });
