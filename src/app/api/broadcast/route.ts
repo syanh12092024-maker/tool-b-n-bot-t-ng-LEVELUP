@@ -1792,104 +1792,64 @@ export async function POST(req: NextRequest) {
                             const file = imageBuffers[imgIdx];
                             let imgSent = false;
                             
-                            // ═══ METHOD 1 (PRIMARY): Pancake upload_contents → content_ids ═══
-                            // Step 1: Upload ảnh lên Pancake server lấy content_id
-                            // Step 2: Gửi tin nhắn với content_ids
+                            // ═══ METHOD 1 (PRIMARY): Upload local server → Pancake content_url ═══
+                            // Cách này ĐÃ HOẠT ĐỘNG trước đây: upload ảnh lên nginx static
+                            // → gửi URL qua Pancake content_url → FB render ảnh native
                             if (pageToken && !imgSent) {
                                 try {
-                                    // Step 1: Upload ảnh lên Pancake
-                                    const uploadUrl = `https://pages.fm/api/public_api/v1/pages/${pageId}/upload_contents?page_access_token=${pageToken}`;
-                                    const uploadFd = new FormData();
-                                    const blob = new Blob([file.buffer], { type: file.type });
-                                    uploadFd.append('file', blob, file.name);
-                                    
-                                    console.log(`[img] Pancake upload_contents img${imgIdx} (${(file.buffer.length/1024).toFixed(0)}KB)...`);
-                                    const uploadRes = await fetch(uploadUrl, {
-                                        method: "POST",
-                                        body: uploadFd,
-                                    });
-                                    const uploadData = await uploadRes.json().catch(() => ({}));
-                                    console.log(`[img] Pancake upload response:`, JSON.stringify(uploadData).slice(0, 200));
-                                    
-                                    // Tìm content_id từ response (có thể trả về dạng khác nhau)
-                                    const contentId = uploadData?.id || uploadData?.content_id || uploadData?.data?.id || uploadData?.data?.content_id;
-                                    
-                                    if (contentId) {
-                                        // Step 2: Gửi tin nhắn với content_ids
-                                        const sendImgRes = await fetch(apiBase, {
-                                            method: "POST",
-                                            headers: { "Content-Type": "application/json" },
-                                            body: JSON.stringify({
-                                                action: "reply_inbox",
-                                                content_ids: [contentId],
-                                            }),
-                                        });
-                                        const sendImgData = await sendImgRes.json().catch(() => ({}));
-                                        if (sendImgData.success) {
-                                            console.log(`[img] ✅ Pancake content_ids img${imgIdx} for ${recipient.name}`);
-                                            imgSent = true;
-                                        } else {
-                                            console.warn(`[img] Pancake content_ids send failed:`, JSON.stringify(sendImgData).slice(0, 150));
-                                        }
-                                    } else {
-                                        console.warn(`[img] Pancake upload_contents no content_id in response`);
-                                    }
-                                } catch (e) {
-                                    console.error(`[img] Pancake upload_contents exception:`, e instanceof Error ? e.message : e);
-                                }
-                            }
-                            
-                            // ═══ METHOD 2: Pancake content_url (upload to external host) ═══
-                            if (!imgSent && pageToken) {
-                                try {
-                                    console.log(`[img] Trying Pancake content_url fallback...`);
                                     const uploadUrl = await uploadImageOnce(file.buffer.toString('base64'));
                                     if (uploadUrl) {
-                                        // Thử content_url trước
+                                        console.log(`[img] Pancake content_url img${imgIdx}: ${uploadUrl}`);
                                         const pancakeImgRes = await fetch(apiBase, {
                                             method: "POST",
                                             headers: { "Content-Type": "application/json" },
                                             body: JSON.stringify({ action: "reply_inbox", content_url: uploadUrl }),
                                         });
                                         const pancakeImgData = await pancakeImgRes.json().catch(() => ({}));
-                                        // Kiểm tra THỰC SỰ thành công (Pancake đôi khi nói success nhưng ảnh broken)
                                         if (pancakeImgData.success && !pancakeImgData.original_error) {
                                             console.log(`[img] ✅ Pancake content_url img${imgIdx} for ${recipient.name}`);
                                             imgSent = true;
                                         } else {
-                                            console.warn(`[img] Pancake content_url issue:`, pancakeImgData.original_error || pancakeImgData.message || JSON.stringify(pancakeImgData).slice(0, 100));
-                                            // Fallback: Gửi URL qua field message
-                                            const pancakeImgRes2 = await fetch(apiBase, {
-                                                method: "POST",
-                                                headers: { "Content-Type": "application/json" },
-                                                body: JSON.stringify({ action: "reply_inbox", message: uploadUrl }),
-                                            });
-                                            const pancakeImgData2 = await pancakeImgRes2.json().catch(() => ({}));
-                                            if (pancakeImgData2.success) {
-                                                console.log(`[img] ✅ Pancake message-url img${imgIdx} for ${recipient.name}`);
-                                                imgSent = true;
-                                            }
+                                            console.warn(`[img] Pancake content_url fail:`, pancakeImgData.original_error || pancakeImgData.message || JSON.stringify(pancakeImgData).slice(0, 150));
+                                        }
+                                    }
+                                } catch (e) {
+                                    console.error(`[img] content_url exception:`, e instanceof Error ? e.message : e);
+                                }
+                            }
+
+                            // ═══ METHOD 2 (FALLBACK): Pancake upload_contents → content_ids ═══
+                            if (!imgSent && pageToken) {
+                                try {
+                                    const uploadApiUrl = `https://pages.fm/api/public_api/v1/pages/${pageId}/upload_contents?page_access_token=${pageToken}`;
+                                    const uploadFd = new FormData();
+                                    const blob = new Blob([file.buffer], { type: file.type });
+                                    uploadFd.append('file', blob, file.name);
+                                    
+                                    console.log(`[img] Fallback: Pancake upload_contents img${imgIdx}...`);
+                                    const uploadRes = await fetch(uploadApiUrl, { method: "POST", body: uploadFd });
+                                    const uploadData = await uploadRes.json().catch(() => ({}));
+                                    const contentId = uploadData?.id || uploadData?.content_id || uploadData?.data?.id || uploadData?.data?.content_id;
+                                    
+                                    if (contentId) {
+                                        const sendImgRes = await fetch(apiBase, {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ action: "reply_inbox", content_ids: [contentId] }),
+                                        });
+                                        const sendImgData = await sendImgRes.json().catch(() => ({}));
+                                        if (sendImgData.success) {
+                                            console.log(`[img] ✅ Pancake content_ids img${imgIdx} for ${recipient.name}`);
+                                            imgSent = true;
+                                        } else {
+                                            console.warn(`[img] content_ids fail:`, JSON.stringify(sendImgData).slice(0, 150));
                                         }
                                     }
                                 } catch { /* ignore */ }
                             }
 
-                            // ═══ METHOD 3: FB Graph API direct binary upload ═══
-                            if (!imgSent && fbPageToken) {
-                                const imgResult = await sendImageDirectViaFacebookGraphAPI(
-                                    recipient.psid, file.buffer, file.name, file.type, fbPageToken
-                                );
-                                if (imgResult.success) {
-                                    console.log(`[img] ✅ FB Direct upload img${imgIdx} for ${recipient.name}`);
-                                    sentVia = 'fb_graph_api';
-                                    imgSent = true;
-                                } else {
-                                    console.warn(`[img] FB Direct upload failed: ${imgResult.error}`);
-                                }
-                            }
-
+                            // ═══ METHOD 3 (LAST RESORT): Gửi URL ảnh dạng text message ═══
                             if (!imgSent) {
-                                // ═══ FALLBACK CUỐI: Gửi URL ảnh dạng text (FB auto-preview) ═══
                                 try {
                                     const uploadUrl = await uploadImageOnce(file.buffer.toString('base64'));
                                     if (uploadUrl) {
@@ -1900,10 +1860,8 @@ export async function POST(req: NextRequest) {
                                         });
                                         const fallbackData = await fallbackRes.json().catch(() => ({}));
                                         if (fallbackData.success) {
-                                            console.log(`[img] ✅ URL-as-text fallback img${imgIdx} for ${recipient.name}`);
+                                            console.log(`[img] ✅ URL-text fallback img${imgIdx} for ${recipient.name}`);
                                             imgSent = true;
-                                        } else {
-                                            console.error(`[img] ❌ URL-as-text also failed for ${recipient.name}`);
                                         }
                                     }
                                 } catch { /* ignore */ }
