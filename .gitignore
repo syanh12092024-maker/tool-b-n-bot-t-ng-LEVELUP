@@ -26,3 +26,9 @@ npm-debug.log*
 # config secrets (keep config structure but not secrets)
 config/bigquery-key.json
 config/firestore-key.json
+config/script-generator.yaml
+config/projects/talpha.yaml
+config/projects/*.yaml
+.env
+.env.local
+.env*.local

@@ -1,0 +1,36 @@
+# ╔══════════════════════════════════════════════════════╗
+# ║  Script Generator — FILE MẪU (KHÔNG chứa secret)     ║
+# ║  Copy → script-generator.yaml, điền giá trị thật.    ║
+# ║  script-generator.yaml đã được .gitignore — KHÔNG     ║
+# ║  commit lên GitHub. Secret nên đặt qua biến môi       ║
+# ║  trường (xem .env.example).                           ║
+# ╚══════════════════════════════════════════════════════╝
+
+# ─── PANCAKE POS SHOPS ───
+poscake:
+  api_url: "https://pos.pages.fm/api/v1"
+  shops:
+    - name: "Saudi"
+      api_key: "<POS_API_KEY>"
+      shop_id: "<SHOP_ID>"
+    # ... thêm các shop khác (UAE, Kuwait, Oman, Qatar, Bahrain, Japan, Taiwan)
+
+# ─── PANCAKE CRM ───
+pancake_crm:
+  api_url: "https://pages.fm/api/v1"
+  # Ưu tiên đặt qua env PANCAKE_CRM_TOKEN; giá trị dưới chỉ là fallback dev.
+  api_token: "<PANCAKE_CRM_JWT>"
+
+# ─── FACEBOOK GRAPH API ───
+facebook_messaging:
+  app_id: "<FB_APP_ID>"
+  # Ưu tiên đặt qua env FB_APP_SECRET và FB_USER_ACCESS_TOKEN.
+  app_secret: "<FB_APP_SECRET>"
+  user_access_token: "<FB_USER_ACCESS_TOKEN>"
+  business_manager_id: "<BM_ID>"
+
+# ─── BOTCAKE ───
+botcake:
+  method: "browser_automation"
+  login_url: ""
+  upload_url: ""

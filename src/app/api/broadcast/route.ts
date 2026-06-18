@@ -87,7 +87,21 @@ function loadConfig(): ScriptGeneratorConfig {
             config.meta_ads = talphaConfig.meta_ads as ScriptGeneratorConfig['meta_ads'];
         }
     } catch { /* ignore if talpha.yaml not found */ }
-    
+
+    // ─── ENV override (secrets) ─────────────────────────────────────────────
+    // Secrets nên đặt qua biến môi trường, KHÔNG commit vào yaml/public repo.
+    // Nếu env var có giá trị → ưu tiên ghi đè lên giá trị trong yaml.
+    if (process.env.FB_USER_ACCESS_TOKEN || process.env.FB_APP_SECRET) {
+        config.facebook_messaging = {
+            ...(config.facebook_messaging ?? {} as ScriptGeneratorConfig['facebook_messaging']),
+            user_access_token: process.env.FB_USER_ACCESS_TOKEN || config.facebook_messaging?.user_access_token,
+            app_secret: process.env.FB_APP_SECRET || config.facebook_messaging?.app_secret,
+        } as ScriptGeneratorConfig['facebook_messaging'];
+    }
+    if (process.env.PANCAKE_CRM_TOKEN && config.pancake_crm) {
+        config.pancake_crm.api_token = process.env.PANCAKE_CRM_TOKEN;
+    }
+
     return config;
 }
 
