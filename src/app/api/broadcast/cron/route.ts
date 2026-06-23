@@ -214,7 +214,9 @@ async function fireSegment(
         || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null)
         || "http://localhost:3001";
 
-    const custUrl = `${baseUrl}/api/broadcast?shopId=${schedule.shopId}&pageFilter=${schedule.pageId}`;
+    // Chỉ kèm shopId khi có giá trị POS thật; nếu rỗng → dùng đường CRM (pageFilter)
+    const shopParam = schedule.shopId ? `shopId=${encodeURIComponent(schedule.shopId)}&` : "";
+    const custUrl = `${baseUrl}/api/broadcast?${shopParam}pageFilter=${schedule.pageId}`;
     log(`  📡 Fetching customers: ${custUrl.replace(/api_key=[^&]+/, "api_key=***")}`);
 
     const custRes = await fetch(custUrl);

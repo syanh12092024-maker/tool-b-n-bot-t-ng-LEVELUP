@@ -33,6 +33,9 @@ export interface BroadcastSchedule {
     nextFireAt: string | null;
     note?: string;
     recipientCount?: number;
+    lastSegmentIndex?: number;
+    lastRunDate?: string;
+    firedDates?: string[];
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -42,6 +45,30 @@ const COLLECTION = "broadcast_schedules";
 const KEY_PATH = path.resolve(process.cwd(), "config/firestore-key.json");
 
 const BASE_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/${DATABASE_ID}/documents`;
+
+// ─── Local-file fallback (khi chạy local, KHÔNG có firestore-key.json) ──────────
+// Nếu có key Firestore → dùng cloud; nếu không → lưu vào data/broadcast-schedules.json
+const USE_LOCAL = !fs.existsSync(KEY_PATH);
+const LOCAL_DIR = path.resolve(process.cwd(), "data");
+const LOCAL_FILE = path.join(LOCAL_DIR, "broadcast-schedules.json");
+
+function localRead(): BroadcastSchedule[] {
+    try {
+        if (fs.existsSync(LOCAL_FILE)) return JSON.parse(fs.readFileSync(LOCAL_FILE, "utf-8"));
+    } catch (e) {
+        console.error("[schedule-local] read error:", e instanceof Error ? e.message : e);
+    }
+    return [];
+}
+
+function localWrite(list: BroadcastSchedule[]): void {
+    if (!fs.existsSync(LOCAL_DIR)) fs.mkdirSync(LOCAL_DIR, { recursive: true });
+    fs.writeFileSync(LOCAL_FILE, JSON.stringify(list, null, 2), "utf-8");
+}
+
+if (USE_LOCAL) {
+    console.log(`[schedule] Dùng lưu trữ LOCAL: ${LOCAL_FILE} (không thấy ${KEY_PATH})`);
+}
 
 // ─── Auth helper ──────────────────────────────────────────────────────────────
 let authClient: GoogleAuth | null = null;
@@ -124,6 +151,7 @@ function scheduleToFields(schedule: BroadcastSchedule): Record<string, unknown> 
 
 // ─── Load all schedules ───────────────────────────────────────────────────────
 export async function loadSchedules(): Promise<BroadcastSchedule[]> {
+    if (USE_LOCAL) return localRead();
     try {
         const token = await getAccessToken();
         const res = await fetch(`${BASE_URL}/${COLLECTION}`, {
@@ -148,6 +176,13 @@ export async function loadSchedules(): Promise<BroadcastSchedule[]> {
 
 // ─── Save (upsert) a schedule ─────────────────────────────────────────────────
 export async function saveSchedule(schedule: BroadcastSchedule): Promise<void> {
+    if (USE_LOCAL) {
+        const list = localRead();
+        const i = list.findIndex((s) => s.id === schedule.id);
+        if (i >= 0) list[i] = schedule; else list.push(schedule);
+        localWrite(list);
+        return;
+    }
     try {
         const token = await getAccessToken();
         const docUrl = `${BASE_URL}/${COLLECTION}/${schedule.id}`;
@@ -174,6 +209,10 @@ export async function saveSchedule(schedule: BroadcastSchedule): Promise<void> {
 
 // ─── Delete a schedule ────────────────────────────────────────────────────────
 export async function deleteSchedule(id: string): Promise<void> {
+    if (USE_LOCAL) {
+        localWrite(localRead().filter((s) => s.id !== id));
+        return;
+    }
     try {
         const token = await getAccessToken();
         const docUrl = `${BASE_URL}/${COLLECTION}/${id}`;

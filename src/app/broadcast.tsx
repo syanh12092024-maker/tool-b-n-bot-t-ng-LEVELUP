@@ -801,8 +801,9 @@ export default function BroadcastTab() {
     const [sendDropdownOpen, setSendDropdownOpen] = useState(false);
     const [forceGraphAPI, setForceGraphAPI] = useState(false);
     // ═══ AUTO-BATCH: Chia nhỏ recipients thành từng đợt ═══
-    const BATCH_SIZE = 50; // Mỗi đợt gửi 50 người
-    const BATCH_DELAY_SEC = 60; // Delay 60s giữa các đợt
+    const BATCH_SIZE = 50;      // Mỗi đợt gửi 50 người
+    const BATCH_DELAY_SEC = 20; // Nghỉ giữa các đợt (giây) — giảm để nhanh hơn, tăng nếu bị #2022
+    const SEND_CHUNK = 8;       // Số người gửi chung 1 request (server xử lý song song)
     const [autoBatchInfo, setAutoBatchInfo] = useState<{ currentBatch: number; totalBatches: number; totalSent: number; totalRecipients: number } | null>(null);
     const [batchCountdown, setBatchCountdown] = useState(0); // Countdown giữa các đợt
 
@@ -871,22 +872,24 @@ export default function BroadcastTab() {
                     totalRecipients: allRecipients.length,
                 });
 
-                // ── Gửi từng người trong batch ──
-                for (let j = 0; j < batch.length; j++) {
+                // ── Gửi theo CHUNK (nhiều người/request → server gửi song song) ──
+                for (let j = 0; j < batch.length; j += SEND_CHUNK) {
                     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
-                    const recipient = batch[j];
+                    const chunk = batch.slice(j, j + SEND_CHUNK);
+                    const chunkStart = globalIdx;
                     setBatchProgress({ sent: globalIdx, total: allRecipients.length });
 
-                    // Mark current as 'sending'
-                    setSendingLog(prev => prev.map((item, idx) => idx === globalIdx ? { ...item, status: 'sending' as const } : item));
+                    // Đánh dấu cả chunk đang gửi
+                    setSendingLog(prev => prev.map((item, idx) =>
+                        (idx >= chunkStart && idx < chunkStart + chunk.length) ? { ...item, status: 'sending' as const } : item));
                     setTimeout(() => logScrollRef.current?.scrollTo({ top: logScrollRef.current.scrollHeight, behavior: 'smooth' }), 50);
 
                     try {
                         let res: Response;
                         if (imageData.length > 0) {
                             const fd = new FormData();
-                            fd.append('recipients', JSON.stringify([recipient]));
+                            fd.append('recipients', JSON.stringify(chunk));
                             fd.append('message', msg || '');
                             for (let imgIdx = 0; imgIdx < imageData.length; imgIdx++) {
                                 const imgStr = imageData[imgIdx];
@@ -903,31 +906,32 @@ export default function BroadcastTab() {
                             res = await fetch("/api/broadcast", {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ recipients: [recipient], message: msg || '', forceGraphAPI }),
+                                body: JSON.stringify({ recipients: chunk, message: msg || '', forceGraphAPI }),
                                 signal,
                             });
                         }
                         const data = await res.json();
-                        if (data.results && data.results.length > 0) {
-                            allResults.push(...data.results);
-                            const ok = data.results[0]?.success;
-                            const capturedIdx = globalIdx;
-                            setSendingLog(prev => prev.map((item, idx) => idx === capturedIdx ? { ...item, status: ok ? 'success' as const : 'error' as const, error: data.results[0]?.error } : item));
-                        } else if (data.error) {
-                            allResults.push({ psid: recipient.psid, name: recipient.name, success: false, error: data.error });
-                            const capturedIdx = globalIdx;
-                            setSendingLog(prev => prev.map((item, idx) => idx === capturedIdx ? { ...item, status: 'error' as const, error: data.error } : item));
-                        }
+                        const results = data.results || [];
+                        allResults.push(...results);
+                        // Khớp kết quả về log theo psid (server trả về không đảm bảo thứ tự)
+                        const byPsid = new Map(results.map((r: SendResult) => [String(r.psid), r]));
+                        setSendingLog(prev => prev.map((item, idx) => {
+                            if (idx < chunkStart || idx >= chunkStart + chunk.length) return item;
+                            const r = byPsid.get(String(chunk[idx - chunkStart].psid)) as SendResult | undefined;
+                            if (!r) return { ...item, status: 'error' as const, error: data.error || 'Không có kết quả' };
+                            return { ...item, status: r.success ? 'success' as const : 'error' as const, error: r.error };
+                        }));
                     } catch (err) {
                         if (err instanceof Error && err.name === 'AbortError') throw err;
-                        allResults.push({ psid: recipient.psid, name: recipient.name, success: false, error: "Network error" });
-                        const capturedIdx = globalIdx;
-                        setSendingLog(prev => prev.map((item, idx) => idx === capturedIdx ? { ...item, status: 'error' as const, error: 'Network error' } : item));
+                        for (const rcp of chunk) allResults.push({ psid: rcp.psid, name: rcp.name, success: false, error: "Network error" });
+                        setSendingLog(prev => prev.map((item, idx) =>
+                            (idx >= chunkStart && idx < chunkStart + chunk.length) ? { ...item, status: 'error' as const, error: 'Network error' } : item));
                     }
 
-                    globalIdx++;
-                    if (j < batch.length - 1) {
-                        await new Promise(resolve => setTimeout(resolve, 300));
+                    globalIdx += chunk.length;
+                    setBatchProgress({ sent: globalIdx, total: allRecipients.length });
+                    if (j + SEND_CHUNK < batch.length) {
+                        await new Promise(resolve => setTimeout(resolve, 200));
                     }
                 }
 

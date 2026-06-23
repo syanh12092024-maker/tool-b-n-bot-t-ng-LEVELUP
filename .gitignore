@@ -32,3 +32,8 @@ config/projects/*.yaml
 .env
 .env.local
 .env*.local
+
+# dữ liệu runtime (lịch đã lưu, ảnh khách upload) + file build
+data/
+public/uploads/
+*.tsbuildinfo

@@ -331,22 +331,26 @@ export async function GET(req: NextRequest) {
                     // ═══ SOURCE 2: Pancake CRM (pages accessible via CRM token) ═══
                     if (config.pancake_crm?.api_token) {
                         try {
-                            const crmPagesUrl = `${config.pancake_crm.api_url}/me?access_token=${config.pancake_crm.api_token}`;
+                            const crmPagesUrl = `${config.pancake_crm.api_url}/pages?access_token=${config.pancake_crm.api_token}&version=v1`;
                             const crmRes = await fetch(crmPagesUrl);
                             const contentType = crmRes.headers.get('content-type') || '';
                             if (contentType.includes('application/json') && crmRes.ok) {
                                 const crmData = await crmRes.json();
-                                // Pancake /me returns user info with pages list
-                                const crmPages = crmData?.pages || crmData?.data?.pages || [];
+                                // Pancake /pages trả về categorized.activated (mỗi item có id + name)
+                                const cat = crmData?.categorized || {};
+                                const crmPages = [
+                                    ...(cat.activated || []),
+                                    ...(cat.hidden || []),
+                                ];
                                 for (const p of crmPages) {
                                     const pid = String(p.id || p.page_id || "");
                                     if (pid) {
                                         addPage(pid, p.name || p.page_name || "", "facebook", "CRM", "crm");
                                     }
                                 }
-                                console.log(`[broadcast] CRM /me pages: found ${crmPages.length} pages`);
+                                console.log(`[broadcast] CRM /pages: found ${crmPages.length} pages`);
                             } else {
-                                console.warn(`[broadcast] CRM /me returned non-JSON (${crmRes.status}), skipping`);
+                                console.warn(`[broadcast] CRM /pages returned non-JSON (${crmRes.status}), skipping`);
                             }
                         } catch (err) {
                             console.error("[broadcast] CRM pages fetch error:", err);
@@ -646,6 +650,138 @@ export async function GET(req: NextRequest) {
 // ─── CRM Conversations fetcher ───────────────────────────────────────────────
 // ═══ Multi-strategy fetch: vượt giới hạn 500 bằng tag-based + cursor splitting ═══
 
+// Map conversation (v1 hoặc public_api) → customer shape dùng cho UI
+function mapCRMCustomers(convs: Array<Record<string, any>>, pageId: string, note: string): object {
+    const customers = convs
+        .filter((c) => c && c.id && (c.from_psid || c.from?.id))
+        .map((c) => {
+            let phone = "";
+            const phoneArr = c.recent_phone_numbers || [];
+            if (phoneArr.length > 0) {
+                const p = phoneArr[0];
+                if (typeof p === "string") phone = p;
+                else if (p && typeof p === "object") phone = p.phone_number || p.captured || "";
+            }
+            if (!phone && c.has_phone) phone = "has_phone";
+            // tags: public_api trả object {id,text}; v1 trả số
+            const resolvedTags = (c.tags || []).map((t: any) =>
+                (t && typeof t === "object") ? String(t.text ?? t.name ?? t.id) : String(t)
+            );
+            return {
+                id: String(c.id || ""),
+                customerName: String(c.from?.name || c.customers?.[0]?.name || "Không rõ tên"),
+                customerPhone: phone,
+                fbId: String(c.id || ""),
+                psid: String(c.from_psid || c.from?.id || ""),
+                pageFbId: String(c.page_id || pageId),
+                customerId: String(c.customers?.[0]?.id || ""),
+                conversationLink: `https://pages.fm/conversations/${String(c.id || "")}`,
+                orderCount: 0,
+                messageCount: Number(c.message_count) || 0,
+                snippet: String(c.snippet || "").replace(/[\r\n]+/g, " ").slice(0, 100),
+                tags: resolvedTags,
+                address: "",
+                updatedAt: String(c.updated_at || c.inserted_at || ""),
+                lastInteraction: String(c.last_customer_interactive_at || c.updated_at || ""),
+                source: "crm" as const,
+            };
+        });
+    return {
+        customers,
+        total: customers.length,
+        page: 1,
+        totalPages: 1,
+        source: "crm",
+        debug: { rawTotal: convs.length, filteredTotal: customers.length, requestedPageId: pageId, note },
+    };
+}
+
+// ═══ Lấy HẾT khách qua public_api — vượt giới hạn 500 của endpoint v1 ═══
+// public_api yêu cầu since + until (≤1 tháng) + page_number (200/trang).
+// → lùi theo từng cửa sổ thời gian, mỗi cửa sổ phân trang đến hết, gộp + khử trùng.
+async function fetchCRMConversations(
+    apiUrl: string,
+    token: string,
+    pageId: string,
+    _page: number
+): Promise<object | null> {
+    const pageToken = await generatePageAccessToken(pageId, token);
+    if (!pageToken) {
+        console.warn(`[broadcast] Không tạo được page token cho ${pageId} → dùng endpoint cũ (≤500)`);
+        return fetchCRMConversationsLegacy(apiUrl, token, pageId, _page);
+    }
+
+    const PUBLIC_BASE = "https://pages.fm/api/public_api/v1";
+    const WINDOW_SEC = 28 * 86400;   // < 1 tháng
+    const PAGE_SIZE = 200;
+    const MAX_WINDOWS = 36;          // ~3 năm lùi lại
+    const MAX_TOTAL = 20000;         // chặn runaway
+    const MAX_EMPTY_WINDOWS = 3;     // dừng sau 3 cửa sổ liên tiếp rỗng
+    const REQ_DELAY = 120;           // ms giữa các lượt (tránh 429)
+    const PAGE_CONCURRENCY = 4;      // số trang lấy song song mỗi lượt
+
+    const fetchJson = async (url: string, retries = 3): Promise<any> => {
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                const res = await fetch(url);
+                if (res.status === 429) {
+                    await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+                    continue;
+                }
+                return await res.json();
+            } catch {
+                await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+            }
+        }
+        return null;
+    };
+
+    const byId = new Map<string, Record<string, any>>();
+    let until = Math.floor(Date.now() / 1000);
+    let emptyStreak = 0;
+    let windowsDone = 0;
+    let stop = false;
+
+    for (windowsDone = 0; windowsDone < MAX_WINDOWS && !stop; windowsDone++) {
+        const since = until - WINDOW_SEC;
+        let windowNew = 0;
+        let lastReached = false;
+        // Lấy nhiều trang SONG SONG (PAGE_CONCURRENCY trang/lượt) cho nhanh
+        for (let pn = 1; pn <= 500 && !lastReached && !stop; pn += PAGE_CONCURRENCY) {
+            const pageNums = Array.from({ length: PAGE_CONCURRENCY }, (_, k) => pn + k);
+            const pages = await Promise.all(
+                pageNums.map((p) =>
+                    fetchJson(`${PUBLIC_BASE}/pages/${pageId}/conversations?page_access_token=${pageToken}&since=${since}&until=${until}&page_number=${p}`)
+                )
+            );
+            for (const d of pages) {
+                const convs: Array<Record<string, any>> = (d && (d.conversations || d.data)) || [];
+                if (convs.length === 0) { lastReached = true; continue; }
+                for (const c of convs) {
+                    const id = String(c.id || "");
+                    if (id && !byId.has(id)) { byId.set(id, c); windowNew++; }
+                }
+                if (convs.length < PAGE_SIZE) lastReached = true;
+            }
+            if (byId.size >= MAX_TOTAL) stop = true;
+            if (!lastReached && !stop) await new Promise((r) => setTimeout(r, REQ_DELAY));
+        }
+        emptyStreak = windowNew === 0 ? emptyStreak + 1 : 0;
+        if (emptyStreak >= MAX_EMPTY_WINDOWS) break;
+        until = since;
+        await new Promise((r) => setTimeout(r, REQ_DELAY));
+    }
+
+    const all = Array.from(byId.values()).filter((c) => String(c.page_id || pageId) === pageId);
+    console.log(`[broadcast] CRM public_api: ${all.length} khách (windows=${windowsDone}, capHit=${byId.size >= MAX_TOTAL})`);
+
+    if (all.length === 0) {
+        // public_api không trả gì → thử endpoint cũ
+        return fetchCRMConversationsLegacy(apiUrl, token, pageId, _page);
+    }
+    return mapCRMCustomers(all, pageId, `public_api: ${all.length} khách qua ${windowsDone} cửa sổ thời gian`);
+}
+
 async function fetchCRMBatch(
     apiUrl: string, token: string, pageId: string, extraParams: string = ""
 ): Promise<{ conversations: CRMConversation[]; error?: string }> {
@@ -660,7 +796,7 @@ async function fetchCRMBatch(
     }
 }
 
-async function fetchCRMConversations(
+async function fetchCRMConversationsLegacy(
     apiUrl: string,
     token: string,
     pageId: string,
@@ -1220,7 +1356,7 @@ async function sendImageDirectViaFacebookGraphAPI(
             fd.append('messaging_type', attempt.messaging_type);
             if (attempt.tag) fd.append('tag', attempt.tag);
 
-            const blob = new Blob([imageBuffer], { type: mimeType });
+            const blob = new Blob([new Uint8Array(imageBuffer)], { type: mimeType });
             fd.append('filedata', blob, fileName);
 
             const res = await fetch(url, { method: "POST", body: fd });
@@ -1569,7 +1705,11 @@ export async function POST(req: NextRequest) {
         // Create message fingerprint for dedup (different messages = different segments = OK)
         const msgFingerprint = message ? message.slice(0, 50) : '';
         
-        for (const recipient of recipients) {
+        // ═══ GỬI SONG SONG THEO LÔ (tăng tốc) ═══
+        const SEND_CONCURRENCY = 8;   // số người gửi cùng lúc mỗi lô (giảm nếu bị rate limit #613)
+        const BATCH_DELAY_MS = 150;   // nghỉ giữa các lô (ms)
+        const sendOne = async (recipient: (typeof recipients)[number]): Promise<void> => {
+          for (const _once of [0]) {
             // ═══ DEDUP CHECK: đã gửi cùng tin nhắn cho PSID này trong 2 phút? ═══
             // Key bao gồm message fingerprint để segment khác nhau KHÔNG bị chặn
             const dedupKey = `${recipient.psid}_${recipient.pageFbId}_${msgFingerprint}`;
@@ -1806,10 +1946,43 @@ export async function POST(req: NextRequest) {
                             const file = imageBuffers[imgIdx];
                             let imgSent = false;
                             
-                            // ═══ METHOD 1 (PRIMARY): Upload local server → Pancake content_url ═══
-                            // Cách này ĐÃ HOẠT ĐỘNG trước đây: upload ảnh lên nginx static
-                            // → gửi URL qua Pancake content_url → FB render ảnh native
-                            if (pageToken && !imgSent) {
+                            // ═══ METHOD 1 (PRIMARY): Upload ảnh BINARY trực tiếp lên Pancake ═══
+                            // KHÔNG cần server ảnh ngoài → chạy được cả khi local. Đây là cách chính.
+                            if (!imgSent && pageToken) {
+                                try {
+                                    const uploadApiUrl = `https://pages.fm/api/public_api/v1/pages/${pageId}/upload_contents?page_access_token=${pageToken}`;
+                                    const uploadFd = new FormData();
+                                    const blob = new Blob([new Uint8Array(file.buffer)], { type: file.type });
+                                    uploadFd.append('file', blob, file.name);
+
+                                    console.log(`[img] upload_contents (binary) img${imgIdx}...`);
+                                    const uploadRes = await fetch(uploadApiUrl, { method: "POST", body: uploadFd });
+                                    const uploadData = await uploadRes.json().catch(() => ({}));
+                                    const contentId = uploadData?.id || uploadData?.content_id || uploadData?.data?.id || uploadData?.data?.content_id;
+
+                                    if (contentId) {
+                                        const sendImgRes = await fetch(apiBase, {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ action: "reply_inbox", content_ids: [contentId] }),
+                                        });
+                                        const sendImgData = await sendImgRes.json().catch(() => ({}));
+                                        if (sendImgData.success) {
+                                            console.log(`[img] ✅ binary content_ids img${imgIdx} for ${recipient.name}`);
+                                            imgSent = true;
+                                        } else {
+                                            console.warn(`[img] binary content_ids fail:`, JSON.stringify(sendImgData).slice(0, 150));
+                                        }
+                                    } else {
+                                        console.warn(`[img] upload_contents không trả content_id:`, JSON.stringify(uploadData).slice(0, 120));
+                                    }
+                                } catch (e) {
+                                    console.error(`[img] binary exception:`, e instanceof Error ? e.message : e);
+                                }
+                            }
+
+                            // ═══ METHOD 2 (FALLBACK): content_url — CHỈ khi đã cấu hình PUBLIC_URL (server ảnh public thật) ═══
+                            if (!imgSent && pageToken && process.env.PUBLIC_URL) {
                                 try {
                                     const uploadUrl = await uploadImageOnce(file.buffer.toString('base64'));
                                     if (uploadUrl) {
@@ -1832,38 +2005,8 @@ export async function POST(req: NextRequest) {
                                 }
                             }
 
-                            // ═══ METHOD 2 (FALLBACK): Pancake upload_contents → content_ids ═══
-                            if (!imgSent && pageToken) {
-                                try {
-                                    const uploadApiUrl = `https://pages.fm/api/public_api/v1/pages/${pageId}/upload_contents?page_access_token=${pageToken}`;
-                                    const uploadFd = new FormData();
-                                    const blob = new Blob([file.buffer], { type: file.type });
-                                    uploadFd.append('file', blob, file.name);
-                                    
-                                    console.log(`[img] Fallback: Pancake upload_contents img${imgIdx}...`);
-                                    const uploadRes = await fetch(uploadApiUrl, { method: "POST", body: uploadFd });
-                                    const uploadData = await uploadRes.json().catch(() => ({}));
-                                    const contentId = uploadData?.id || uploadData?.content_id || uploadData?.data?.id || uploadData?.data?.content_id;
-                                    
-                                    if (contentId) {
-                                        const sendImgRes = await fetch(apiBase, {
-                                            method: "POST",
-                                            headers: { "Content-Type": "application/json" },
-                                            body: JSON.stringify({ action: "reply_inbox", content_ids: [contentId] }),
-                                        });
-                                        const sendImgData = await sendImgRes.json().catch(() => ({}));
-                                        if (sendImgData.success) {
-                                            console.log(`[img] ✅ Pancake content_ids img${imgIdx} for ${recipient.name}`);
-                                            imgSent = true;
-                                        } else {
-                                            console.warn(`[img] content_ids fail:`, JSON.stringify(sendImgData).slice(0, 150));
-                                        }
-                                    }
-                                } catch { /* ignore */ }
-                            }
-
-                            // ═══ METHOD 3 (LAST RESORT): Gửi URL ảnh dạng text message ═══
-                            if (!imgSent) {
+                            // ═══ METHOD 3 (LAST RESORT): Gửi URL ảnh dạng text — CHỈ khi có PUBLIC_URL ═══
+                            if (!imgSent && process.env.PUBLIC_URL) {
                                 try {
                                     const uploadUrl = await uploadImageOnce(file.buffer.toString('base64'));
                                     if (uploadUrl) {
@@ -1902,8 +2045,7 @@ export async function POST(req: NextRequest) {
                     results.push({ psid: recipient.psid, name: recipient.name, success: false, error: "Gửi thất bại", via: sentVia });
                 }
 
-                // Delay 500ms between recipients
-                await new Promise((resolve) => setTimeout(resolve, 500));
+                // (delay đã chuyển sang cấp độ lô — xem vòng lặp song song bên dưới)
             } catch (err: unknown) {
                 results.push({
                     psid: recipient.psid,
@@ -1911,6 +2053,16 @@ export async function POST(req: NextRequest) {
                     success: false,
                     error: err instanceof Error ? err.message : "Network error",
                 });
+            }
+          }
+        };
+
+        // Chạy gửi song song theo lô SEND_CONCURRENCY người, nghỉ BATCH_DELAY_MS giữa các lô
+        for (let i = 0; i < recipients.length; i += SEND_CONCURRENCY) {
+            const chunk = recipients.slice(i, i + SEND_CONCURRENCY);
+            await Promise.all(chunk.map((r) => sendOne(r)));
+            if (i + SEND_CONCURRENCY < recipients.length) {
+                await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
             }
         }
 
