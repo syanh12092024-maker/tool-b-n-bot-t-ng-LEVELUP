@@ -1948,36 +1948,59 @@ export async function POST(req: NextRequest) {
                             
                             // ═══ METHOD 1 (PRIMARY): Upload ảnh BINARY trực tiếp lên Pancake ═══
                             // KHÔNG cần server ảnh ngoài → chạy được cả khi local. Đây là cách chính.
+                            // Retry tối đa 3 lần: tự LÀM MỚI TOKEN khi gặp error_code 105 (Pancake xoay token
+                            // giữa chừng), và thử lại khi upload attachment lỗi tạm thời. KHÔNG retry khi FB
+                            // chặn #2022 (chặn chính sách) để tránh làm page bị chặn nặng/lâu hơn.
                             if (!imgSent && pageToken) {
-                                try {
-                                    const uploadApiUrl = `https://pages.fm/api/public_api/v1/pages/${pageId}/upload_contents?page_access_token=${pageToken}`;
-                                    const uploadFd = new FormData();
-                                    const blob = new Blob([new Uint8Array(file.buffer)], { type: file.type });
-                                    uploadFd.append('file', blob, file.name);
+                                let imgBlocked = false;
+                                for (let imgAttempt = 0; imgAttempt < 3 && !imgSent && !imgBlocked; imgAttempt++) {
+                                    try {
+                                        const curToken = pageTokens.get(pageId) || pageToken;
+                                        const uploadApiUrl = `https://pages.fm/api/public_api/v1/pages/${pageId}/upload_contents?page_access_token=${curToken}`;
+                                        const uploadFd = new FormData();
+                                        const blob = new Blob([new Uint8Array(file.buffer)], { type: file.type });
+                                        uploadFd.append('file', blob, file.name);
 
-                                    console.log(`[img] upload_contents (binary) img${imgIdx}...`);
-                                    const uploadRes = await fetch(uploadApiUrl, { method: "POST", body: uploadFd });
-                                    const uploadData = await uploadRes.json().catch(() => ({}));
-                                    const contentId = uploadData?.id || uploadData?.content_id || uploadData?.data?.id || uploadData?.data?.content_id;
+                                        console.log(`[img] upload_contents (binary) img${imgIdx}${imgAttempt > 0 ? ` (thử lại ${imgAttempt})` : ''}...`);
+                                        const uploadRes = await fetch(uploadApiUrl, { method: "POST", body: uploadFd });
+                                        const uploadData = await uploadRes.json().catch(() => ({}));
+                                        const contentId = uploadData?.id || uploadData?.content_id || uploadData?.data?.id || uploadData?.data?.content_id;
+                                        const uCode = uploadData?.error_code || uploadData?.code;
 
-                                    if (contentId) {
-                                        const sendImgRes = await fetch(apiBase, {
-                                            method: "POST",
-                                            headers: { "Content-Type": "application/json" },
-                                            body: JSON.stringify({ action: "reply_inbox", content_ids: [contentId] }),
-                                        });
-                                        const sendImgData = await sendImgRes.json().catch(() => ({}));
-                                        if (sendImgData.success) {
-                                            console.log(`[img] ✅ binary content_ids img${imgIdx} for ${recipient.name}`);
-                                            imgSent = true;
-                                        } else {
+                                        if (contentId) {
+                                            const sendImgUrl = `https://pages.fm/api/public_api/v1/pages/${pageId}/conversations/${convoId}/messages?page_access_token=${curToken}`;
+                                            const sendImgRes = await fetch(sendImgUrl, {
+                                                method: "POST",
+                                                headers: { "Content-Type": "application/json" },
+                                                body: JSON.stringify({ action: "reply_inbox", content_ids: [contentId] }),
+                                            });
+                                            const sendImgData = await sendImgRes.json().catch(() => ({}));
+                                            if (sendImgData.success) {
+                                                console.log(`[img] ✅ binary content_ids img${imgIdx} for ${recipient.name}`);
+                                                imgSent = true;
+                                                break;
+                                            }
+                                            const sCode = sendImgData.error_code || sendImgData.code || sendImgData.e_code;
                                             console.warn(`[img] binary content_ids fail:`, JSON.stringify(sendImgData).slice(0, 150));
+                                            if (sCode === 2022) { imgBlocked = true; console.warn(`[img] ⛔ Page bị FB chặn #2022 — ngừng thử ảnh`); break; }
+                                            if (sCode === 105 && crmToken) {
+                                                const fresh = await generatePageAccessToken(pageId, crmToken);
+                                                if (fresh) { pageTokens.set(pageId, fresh); console.log(`[img] 🔄 Làm mới token page ${pageId}, thử lại`); continue; }
+                                            }
+                                            if (imgAttempt < 2) { await new Promise(r => setTimeout(r, 700)); continue; }
+                                        } else {
+                                            console.warn(`[img] upload_contents không trả content_id:`, JSON.stringify(uploadData).slice(0, 120));
+                                            if (uCode === 2022) { imgBlocked = true; break; }
+                                            if (uCode === 105 && crmToken) {
+                                                const fresh = await generatePageAccessToken(pageId, crmToken);
+                                                if (fresh) { pageTokens.set(pageId, fresh); console.log(`[img] 🔄 Làm mới token page ${pageId}, thử lại`); continue; }
+                                            }
+                                            if (imgAttempt < 2) { await new Promise(r => setTimeout(r, 700)); continue; }
                                         }
-                                    } else {
-                                        console.warn(`[img] upload_contents không trả content_id:`, JSON.stringify(uploadData).slice(0, 120));
+                                    } catch (e) {
+                                        console.error(`[img] binary exception:`, e instanceof Error ? e.message : e);
+                                        if (imgAttempt < 2) { await new Promise(r => setTimeout(r, 700)); continue; }
                                     }
-                                } catch (e) {
-                                    console.error(`[img] binary exception:`, e instanceof Error ? e.message : e);
                                 }
                             }
 

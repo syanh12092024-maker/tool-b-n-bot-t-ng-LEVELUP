@@ -320,7 +320,8 @@ async function fireSegment(
     // 3. Send messages in parallel batches
     let successCount = 0;
     let errorCount = 0;
-    const BATCH_SIZE = 20;
+    // Gửi chậm hơn để giảm nguy cơ FB chặn #2022 (spam): 8 khách/lô, giãn 2.5s giữa các lô.
+    const BATCH_SIZE = 8;
 
     let aborted = false;
     for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
@@ -407,7 +408,7 @@ async function fireSegment(
 
         // Delay between batches to respect rate limits
         if (i + BATCH_SIZE < recipients.length) {
-            await new Promise((r) => setTimeout(r, 1000));
+            await new Promise((r) => setTimeout(r, 2500));
         }
     }
 
