@@ -6,7 +6,7 @@ import {
     Send, Users, RefreshCw, CheckCircle2, XCircle, Loader2,
     ChevronDown, Search, CheckSquare, Square, MessageSquare,
     AlertTriangle, ShoppingBag, Phone, ExternalLink, ImagePlus, X,
-    Clock, Timer, CalendarClock, Filter, Pencil
+    Clock, Timer, CalendarClock, Filter, Pencil, Zap
 } from "lucide-react";
 
 // ─── Timezone mapping ─────────────────────────────────────────────────────────
@@ -251,6 +251,10 @@ export default function BroadcastTab() {
     const [scheduledSegments, setScheduledSegments] = useState<Set<number>>(new Set());
     const [isGlobalPaused, setIsGlobalPaused] = useState(false);
     const [isLoadingSchedules, setIsLoadingSchedules] = useState(false);
+    // Bắn ngay 1 lịch: id của thẻ đang mở popup chọn đoạn + segIdx đang gửi
+    const [fireNowId, setFireNowId] = useState<string | null>(null);
+    const [firingSegKey, setFiringSegKey] = useState<string | null>(null);
+    const fireAbortRef = useRef<AbortController | null>(null);
 
     const toggleGlobalPause = () => {
         // Global pause: toggle isActive for ALL schedules via API
@@ -579,85 +583,12 @@ export default function BroadcastTab() {
         const pageName = pages.find(p => p.pageId === selectedPageId)?.name || selectedPageId;
         const tz = shopTz.offset;
 
-        // ═══ UPLOAD ẢNH TRƯỚC: chuyển base64 → URL để tránh vượt 1MB Firestore limit ═══
-        setScheduleToast("⏳ Đang upload ảnh...");
-        console.log('[schedule] filledSegments media:', filledSegments.map(s => ({ idx: s.idx, mediaCount: s.media.length, mediaPreview: s.media.map(m => m.substring(0, 30)) })));
-        
-        const uploadedSegments = await Promise.all(filledSegments.map(async (seg) => {
-            if (!seg.media || seg.media.length === 0) {
-                console.log(`[schedule] Seg ${seg.idx}: no media`);
-                return { ...seg, mediaUrls: [] as string[] };
-            }
-            
-            console.log(`[schedule] Seg ${seg.idx}: uploading ${seg.media.length} images...`);
-            const urls: string[] = [];
-            for (const dataUrl of seg.media) {
-                if (dataUrl.startsWith('http')) {
-                    // Already a URL (from edit mode), keep as-is
-                    urls.push(dataUrl);
-                    console.log(`[schedule] Seg ${seg.idx}: URL passthrough: ${dataUrl.substring(0, 60)}`);
-                    continue;
-                }
-                // base64 → upload to host
-                try {
-                    const match = dataUrl.match(/^data:[^;]+;base64,(.+)$/);
-                    if (!match) {
-                        console.warn(`[schedule] Seg ${seg.idx}: invalid data URL format: ${dataUrl.substring(0, 40)}`);
-                        continue;
-                    }
-                    const base64 = match[1];
-                    
-                    // Try freeimage.host first
-                    let uploadedUrl: string | null = null;
-                    try {
-                        const fd = new FormData();
-                        const blob = new Blob([Uint8Array.from(atob(base64), c => c.charCodeAt(0))], { type: 'image/png' });
-                        fd.append('source', blob, 'image.png');
-                        fd.append('type', 'file');
-                        fd.append('action', 'upload');
-                        const res = await fetch('https://freeimage.host/api/1/upload?key=6d207e02198a847aa98d0a2a901485a5', {
-                            method: 'POST', body: fd,
-                        });
-                        const data = await res.json();
-                        if (data?.image?.url) {
-                            uploadedUrl = data.image.url;
-                        } else {
-                            console.warn('[schedule] freeimage.host failed:', JSON.stringify(data).substring(0, 200));
-                        }
-                    } catch (err) {
-                        console.warn('[schedule] freeimage.host error:', err);
-                    }
-                    
-                    // Fallback: imgbb
-                    if (!uploadedUrl) {
-                        try {
-                            const fd2 = new FormData();
-                            fd2.append('image', base64);
-                            const res2 = await fetch('https://api.imgbb.com/1/upload?key=4e37bdbc3b6e2a84c28c47e0cce3e53f', {
-                                method: 'POST', body: fd2,
-                            });
-                            const data2 = await res2.json();
-                            if (data2?.data?.url) {
-                                uploadedUrl = data2.data.url;
-                                console.log('[schedule] imgbb fallback OK:', uploadedUrl);
-                            }
-                        } catch (err2) {
-                            console.error('[schedule] imgbb fallback error:', err2);
-                        }
-                    }
-                    
-                    if (uploadedUrl) {
-                        urls.push(uploadedUrl);
-                        console.log(`[schedule] Seg ${seg.idx}: ✅ uploaded: ${uploadedUrl}`);
-                    } else {
-                        console.error(`[schedule] Seg ${seg.idx}: ❌ ALL uploads failed`);
-                    }
-                } catch (err) {
-                    console.error('[schedule-upload] Error:', err);
-                }
-            }
-            console.log(`[schedule] Seg ${seg.idx}: ${urls.length} URLs ready`);
-            return { ...seg, mediaUrls: urls };
+        // ═══ LƯU ẢNH: giữ thẳng base64 trong lịch (tự chứa, không phụ thuộc dịch vụ ngoài) ═══
+        // fireSegment gửi base64 trực tiếp lên Facebook dạng bytes — không cần upload/host.
+        setScheduleToast("⏳ Đang lưu lịch...");
+        const uploadedSegments = filledSegments.map((seg) => ({
+            ...seg,
+            mediaUrls: (seg.media || []).filter(Boolean), // base64 data URL hoặc http URL (chế độ Sửa) — giữ nguyên
         }));
 
         // ═══ TẠO 1 ENTRY DUY NHẤT chứa tất cả segments ═══
@@ -712,6 +643,47 @@ export default function BroadcastTab() {
     const handleDeleteSchedule = async (id: string) => {
         await deleteScheduleFromAPI(id);
         refreshSchedules();
+    };
+
+    // ─── BẮN NGAY 1 đoạn của 1 lịch (bỏ qua giờ hẹn) ──────────────────────────
+    const handleFireNow = async (s: BroadcastSchedule, segIdx: number, hour: number) => {
+        const segKey = `${s.id}_${segIdx}`;
+        if (firingSegKey) return; // đang gửi, chặn bấm trùng
+        if (!confirm(`⚡ Bắn NGAY đoạn ${SCHEDULE_LABELS[hour] || hour + "h"} cho "${s.pageName}"?\n\nTin sẽ gửi tới khách hàng ngay lập tức.`)) return;
+        const controller = new AbortController();
+        fireAbortRef.current = controller;
+        setFiringSegKey(segKey);
+        setFireNowId(null);
+        setScheduleToast(`⏳ Đang bắn ngay đoạn ${SCHEDULE_LABELS[hour] || hour + "h"}... (có thể bấm Huỷ bắn)`);
+        try {
+            const res = await fetch(`/api/broadcast/cron?fire=${encodeURIComponent(s.id)}&seg=${segIdx}`, { signal: controller.signal });
+            const data = await res.json();
+            if (data.ok && data.result) {
+                const r = data.result;
+                setScheduleToast(`✅ Đã bắn: ${r.success}/${r.recipients} khách thành công${r.errors ? ` (❌${r.errors} lỗi)` : ""}`);
+            } else {
+                setScheduleToast(`❌ Lỗi bắn ngay: ${data.error || "không rõ"}`);
+            }
+        } catch (err) {
+            if (err instanceof Error && err.name === "AbortError") {
+                setScheduleToast(`⛔ Đã huỷ bắn (các tin đã gửi trước đó vẫn được gửi)`);
+            } else {
+                setScheduleToast(`❌ Lỗi kết nối: ${err instanceof Error ? err.message : "unknown"}`);
+            }
+        } finally {
+            fireAbortRef.current = null;
+            setFiringSegKey(null);
+            refreshSchedules();
+            setTimeout(() => setScheduleToast(null), 5000);
+        }
+    };
+
+    // ─── HUỶ BẮN: ngắt request đang gửi → server dừng giữa các lô ──────────────
+    const handleCancelFire = () => {
+        if (fireAbortRef.current) {
+            fireAbortRef.current.abort();
+            setScheduleToast(`⛔ Đang huỷ bắn...`);
+        }
     };
 
     // ✅ Auto-fire: gọi cron endpoint mỗi 5 phút để tự bắn khi đến giờ
@@ -1647,6 +1619,51 @@ export default function BroadcastTab() {
                                 {/* Row 1: Actions (left) + Info (right) */}
                                 <div className="flex items-start gap-3">
                                     <div className="flex flex-col gap-1 flex-shrink-0 pt-0.5">
+                                        <div className="relative">
+                                            <button
+                                                onClick={() => setFireNowId(fireNowId === s.id ? null : s.id)}
+                                                disabled={!!firingSegKey}
+                                                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold bg-orange-500 text-white hover:bg-orange-600 transition-colors disabled:opacity-50 w-full justify-center"
+                                            >
+                                                {firingSegKey?.startsWith(s.id + "_")
+                                                    ? <><Loader2 className="h-3 w-3 animate-spin" /> Đang bắn</>
+                                                    : <><Zap className="h-3 w-3" /> Bắn ngay</>}
+                                            </button>
+                                            {fireNowId === s.id && !firingSegKey && (
+                                                <div className="absolute left-0 top-full mt-1 z-20 bg-white rounded-lg shadow-lg border border-orange-200 p-1.5 w-40 space-y-1">
+                                                    <div className="text-[10px] font-semibold text-slate-500 px-1 pb-0.5">Chọn đoạn để bắn:</div>
+                                                    {segs
+                                                        .filter(seg => (seg.message || "").trim() || (seg.media && seg.media.length))
+                                                        .map(seg => (
+                                                            <button
+                                                                key={seg.segIdx}
+                                                                onClick={() => handleFireNow(s, seg.segIdx, seg.hour)}
+                                                                className="flex items-center gap-1 w-full text-left px-2 py-1 rounded-md text-[11px] font-medium bg-orange-50 text-orange-700 hover:bg-orange-100 transition-colors"
+                                                            >
+                                                                <Zap className="h-3 w-3 flex-shrink-0" />
+                                                                {SCHEDULE_LABELS[seg.hour] || `${seg.hour}h`}
+                                                            </button>
+                                                        ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                        {(() => {
+                                            const isFiringThis = firingSegKey?.startsWith(s.id + "_");
+                                            return (
+                                                <button
+                                                    onClick={handleCancelFire}
+                                                    disabled={!isFiringThis}
+                                                    className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold transition-colors w-full justify-center ${
+                                                        isFiringThis
+                                                            ? "bg-red-500 text-white hover:bg-red-600 animate-pulse"
+                                                            : "bg-red-50 text-red-300 cursor-not-allowed"
+                                                    }`}
+                                                    title={isFiringThis ? "Dừng đợt đang gửi" : "Chỉ bấm được khi đang bắn"}
+                                                >
+                                                    <X className="h-3 w-3" /> Huỷ bắn
+                                                </button>
+                                            );
+                                        })()}
                                         <button
                                             onClick={() => toggleScheduleActive(s.id)}
                                             className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold transition-colors ${

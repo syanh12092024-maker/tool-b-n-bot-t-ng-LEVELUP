@@ -88,6 +88,56 @@ export async function GET(req: NextRequest) {
             return NextResponse.json({ ok: true, message: "No schedules", logs });
         }
 
+        // ─── BẮN NGAY 1 ĐOẠN (manual fire, bỏ qua kiểm tra giờ) ───────────────
+        // GET /api/broadcast/cron?fire=<scheduleId>&seg=<segIdx>
+        const fireId = new URL(req.url).searchParams.get("fire");
+        if (fireId) {
+            const segParam = new URL(req.url).searchParams.get("seg");
+            const schedule = schedules.find((s) => s.id === fireId);
+            if (!schedule) {
+                return NextResponse.json({ ok: false, error: "Không tìm thấy lịch" }, { status: 404 });
+            }
+
+            const tz = SHOP_TIMEZONES[schedule.shopName] ?? 3;
+            const todayStr = getTodayDateStr(tz);
+
+            // Backward-compat: tạo segments từ messages nếu lịch cũ chưa có segments
+            const allSegs: ScheduleSegment[] = schedule.segments?.length
+                ? schedule.segments
+                : (schedule.messages || [])
+                      .map((m, i) => ({ segIdx: i, hour: schedule.hour, message: m }))
+                      .filter((seg) => (seg.message || "").trim());
+            schedule.segments = allSegs;
+
+            // Chọn đoạn: theo segIdx nếu có, ngược lại lấy đoạn đầu có nội dung
+            const target =
+                segParam !== null
+                    ? allSegs.find((seg) => seg.segIdx === Number(segParam))
+                    : allSegs.find((seg) => (seg.message || "").trim() || (seg.media && seg.media.length));
+            if (!target) {
+                return NextResponse.json({ ok: false, error: "Đoạn không tồn tại hoặc rỗng" }, { status: 400 });
+            }
+            if (!(target.message || "").trim() && !(target.media && target.media.length)) {
+                return NextResponse.json({ ok: false, error: "Đoạn này không có nội dung" }, { status: 400 });
+            }
+
+            log(`🚀 MANUAL FIRE Seg ${target.segIdx} (${target.hour}h) của lịch ${schedule.id}`);
+            target.status = "sending";
+            schedule.lastRunDate = todayStr;
+            await saveSchedule(schedule);
+
+            try {
+                const fired = await fireSegment(schedule, target, todayStr, log, req.signal);
+                await saveSchedule(schedule);
+                return NextResponse.json({ ok: true, fired: 1, manual: true, result: fired, logs });
+            } catch (err) {
+                target.status = "error";
+                target.error = err instanceof Error ? err.message : String(err);
+                await saveSchedule(schedule);
+                return NextResponse.json({ ok: false, error: target.error, logs }, { status: 500 });
+            }
+        }
+
         let totalFired = 0;
         const results: Array<{
             scheduleId: string;
@@ -207,8 +257,9 @@ async function fireSegment(
     schedule: BroadcastSchedule,
     seg: ScheduleSegment,
     todayStr: string,
-    log: (msg: string) => void
-): Promise<{ scheduleId: string; segIdx: number; hour: number; recipients: number; success: number; errors: number }> {
+    log: (msg: string) => void,
+    signal?: AbortSignal
+): Promise<{ scheduleId: string; segIdx: number; hour: number; recipients: number; success: number; errors: number; aborted?: boolean }> {
     // 1. Fetch customers for this shop+page
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL
         || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null)
@@ -271,9 +322,16 @@ async function fireSegment(
     let errorCount = 0;
     const BATCH_SIZE = 20;
 
+    let aborted = false;
     for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+        // ⛔ Huỷ bắn: client ngắt kết nối → dừng giữa các lô
+        if (signal?.aborted) {
+            aborted = true;
+            log(`  ⛔ HUỶ BẮN tại ${successCount}/${recipients.length} (đã gửi xong các lô trước)`);
+            break;
+        }
         const batch = recipients.slice(i, i + BATCH_SIZE);
-        
+
         const promises = batch.map(async (recipient) => {
             try {
                 const hasMedia = seg.media && seg.media.length > 0;
@@ -357,7 +415,21 @@ async function fireSegment(
     seg.totalRecipients = recipients.length;
     seg.successCount = successCount;
     seg.errorCount = errorCount;
-    
+
+    if (aborted) {
+        // Bị huỷ giữa chừng: đánh dấu đã gửi (tránh gửi trùng phần đã gửi),
+        // ghi rõ là huỷ. Không thêm vào firedDates.
+        seg.status = successCount > 0 ? "sent" : "pending";
+        seg.sentAt = new Date().toISOString();
+        seg.error = `⛔ Đã huỷ — gửi ${successCount}/${recipients.length}`;
+        schedule.lastFiredAt = new Date().toISOString();
+        log(`  ⛔ Aborted: ${successCount}/${recipients.length} đã gửi`);
+        return {
+            scheduleId: schedule.id, segIdx: seg.segIdx, hour: seg.hour,
+            recipients: recipients.length, success: successCount, errors: errorCount, aborted: true,
+        };
+    }
+
     if (errorCount === 0) {
         seg.status = "sent";
         seg.sentAt = new Date().toISOString();
