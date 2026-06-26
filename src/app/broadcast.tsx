@@ -773,9 +773,9 @@ export default function BroadcastTab() {
     const [sendDropdownOpen, setSendDropdownOpen] = useState(false);
     const [forceGraphAPI, setForceGraphAPI] = useState(false);
     // ═══ AUTO-BATCH: Chia nhỏ recipients thành từng đợt ═══
-    const BATCH_SIZE = 50;      // Mỗi đợt gửi 50 người
-    const BATCH_DELAY_SEC = 20; // Nghỉ giữa các đợt (giây) — giảm để nhanh hơn, tăng nếu bị #2022
-    const SEND_CHUNK = 8;       // Số người gửi chung 1 request (server xử lý song song)
+    const BATCH_SIZE = 100;     // Mỗi đợt gửi 100 người
+    const BATCH_DELAY_SEC = 8;  // Nghỉ giữa các đợt (giây) — giảm để nhanh hơn, tăng nếu bị #2022
+    const SEND_CHUNK = 16;      // Số người gửi chung 1 request (server xử lý song song)
     const [autoBatchInfo, setAutoBatchInfo] = useState<{ currentBatch: number; totalBatches: number; totalSent: number; totalRecipients: number } | null>(null);
     const [batchCountdown, setBatchCountdown] = useState(0); // Countdown giữa các đợt
 

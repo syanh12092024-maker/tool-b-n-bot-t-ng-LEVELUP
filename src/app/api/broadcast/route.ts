@@ -1706,8 +1706,8 @@ export async function POST(req: NextRequest) {
         const msgFingerprint = message ? message.slice(0, 50) : '';
         
         // ═══ GỬI SONG SONG THEO LÔ (tăng tốc) ═══
-        const SEND_CONCURRENCY = 8;   // số người gửi cùng lúc mỗi lô (giảm nếu bị rate limit #613)
-        const BATCH_DELAY_MS = 150;   // nghỉ giữa các lô (ms)
+        const SEND_CONCURRENCY = 16;  // số người gửi cùng lúc mỗi lô (giảm nếu bị rate limit #613)
+        const BATCH_DELAY_MS = 80;    // nghỉ giữa các lô (ms)
         const sendOne = async (recipient: (typeof recipients)[number]): Promise<void> => {
           for (const _once of [0]) {
             // ═══ DEDUP CHECK: đã gửi cùng tin nhắn cho PSID này trong 2 phút? ═══
