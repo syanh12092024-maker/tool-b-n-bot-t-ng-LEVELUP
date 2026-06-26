@@ -1108,11 +1108,51 @@ interface BroadcastRequest {
     forceGraphAPI?: boolean;
 }
 
+// Cache page_access_token lấy TRỰC TIẾP từ danh sách /pages.
+// Lý do: endpoint generate_page_access_token của Pancake hay trả "Server internal error",
+// trong khi mỗi page trong /pages đã có sẵn settings.page_access_token dùng được.
+const pageTokenDirectCache: { map: Map<string, string>; expires: number } = {
+    map: new Map(),
+    expires: 0,
+};
+
+async function loadPageTokensFromList(userToken: string): Promise<void> {
+    if (pageTokenDirectCache.expires > Date.now() && pageTokenDirectCache.map.size > 0) return;
+    try {
+        const res = await fetch(`https://pages.fm/api/v1/pages?access_token=${userToken}&version=v1`);
+        const data = await res.json();
+        const cat = data?.categorized || {};
+        const all = [
+            ...(cat.activated || []),
+            ...(cat.suspended || []),
+            ...(cat.not_activated || []),
+        ];
+        const map = new Map<string, string>();
+        for (const p of all) {
+            const pat = p?.settings?.page_access_token;
+            if (p?.id && pat) map.set(String(p.id), pat);
+        }
+        if (map.size > 0) {
+            pageTokenDirectCache.map = map;
+            pageTokenDirectCache.expires = Date.now() + 5 * 60 * 1000; // cache 5 phút
+            console.log(`[broadcast] Loaded ${map.size} page tokens directly from /pages list`);
+        }
+    } catch (err) {
+        console.error("[broadcast] loadPageTokensFromList error:", err);
+    }
+}
+
 // Generate Pancake Page Access Token
 async function generatePageAccessToken(
     pageId: string,
     userToken: string
 ): Promise<string | null> {
+    // 1) Ưu tiên token có sẵn trong /pages (endpoint generate đang lỗi server)
+    await loadPageTokensFromList(userToken);
+    const direct = pageTokenDirectCache.map.get(String(pageId));
+    if (direct) return direct;
+
+    // 2) Fallback: gọi endpoint generate_page_access_token (có thể trả "Server internal error")
     try {
         const res = await fetch(
             `https://pages.fm/api/v1/pages/${pageId}/generate_page_access_token?access_token=${userToken}`,
