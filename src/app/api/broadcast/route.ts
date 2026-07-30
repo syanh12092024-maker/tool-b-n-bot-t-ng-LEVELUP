@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import yaml from "js-yaml";
 import sharp from "sharp";
+import { requireAppKey } from "@/lib/auth";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface ShopConfig {
@@ -107,6 +108,8 @@ function loadConfig(): ScriptGeneratorConfig {
 
 // ─── GET: Lấy conversations (CRM) hoặc customers (POS fallback) ─────────────
 export async function GET(req: NextRequest) {
+    const authError = requireAppKey(req);
+    if (authError) return authError;
     try {
         const config = loadConfig();
         const { searchParams } = new URL(req.url);
@@ -696,6 +699,12 @@ function mapCRMCustomers(convs: Array<Record<string, any>>, pageId: string, note
     };
 }
 
+// ═══ CACHE kết quả danh sách khách theo page (10 phút) ═══
+// Cron bắn nhiều segment liên tiếp trên cùng page sẽ không phải fetch lại
+// toàn bộ 36 cửa sổ thời gian (~2-3 phút) mỗi lần.
+const crmConvCache = new Map<string, { data: object; ts: number }>();
+const CRM_CONV_CACHE_MS = 10 * 60 * 1000;
+
 // ═══ Lấy HẾT khách qua public_api — vượt giới hạn 500 của endpoint v1 ═══
 // public_api yêu cầu since + until (≤1 tháng) + page_number (200/trang).
 // → lùi theo từng cửa sổ thời gian, mỗi cửa sổ phân trang đến hết, gộp + khử trùng.
@@ -705,6 +714,12 @@ async function fetchCRMConversations(
     pageId: string,
     _page: number
 ): Promise<object | null> {
+    const cached = crmConvCache.get(pageId);
+    if (cached && Date.now() - cached.ts < CRM_CONV_CACHE_MS) {
+        console.log(`[broadcast] CRM cache hit cho page ${pageId}`);
+        return cached.data;
+    }
+
     const pageToken = await generatePageAccessToken(pageId, token);
     if (!pageToken) {
         console.warn(`[broadcast] Không tạo được page token cho ${pageId} → dùng endpoint cũ (≤500)`);
@@ -723,7 +738,8 @@ async function fetchCRMConversations(
     const fetchJson = async (url: string, retries = 3): Promise<any> => {
         for (let attempt = 0; attempt <= retries; attempt++) {
             try {
-                const res = await fetch(url);
+                // Timeout 20s/request — 1 request treo không được phép treo cả endpoint
+                const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
                 if (res.status === 429) {
                     await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
                     continue;
@@ -779,7 +795,9 @@ async function fetchCRMConversations(
         // public_api không trả gì → thử endpoint cũ
         return fetchCRMConversationsLegacy(apiUrl, token, pageId, _page);
     }
-    return mapCRMCustomers(all, pageId, `public_api: ${all.length} khách qua ${windowsDone} cửa sổ thời gian`);
+    const result = mapCRMCustomers(all, pageId, `public_api: ${all.length} khách qua ${windowsDone} cửa sổ thời gian`);
+    if (result) crmConvCache.set(pageId, { data: result, ts: Date.now() });
+    return result;
 }
 
 async function fetchCRMBatch(
@@ -787,7 +805,7 @@ async function fetchCRMBatch(
 ): Promise<{ conversations: CRMConversation[]; error?: string }> {
     const url = `${apiUrl}/pages/${pageId}/conversations?access_token=${token}&limit=500${extraParams}`;
     try {
-        const res = await fetch(url);
+        const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
         const data = await res.json();
         if (data.error_code) return { conversations: [], error: `[${data.error_code}] ${data.message}` };
         return { conversations: data.conversations || [] };
@@ -1119,7 +1137,7 @@ const pageTokenDirectCache: { map: Map<string, string>; expires: number } = {
 async function loadPageTokensFromList(userToken: string): Promise<void> {
     if (pageTokenDirectCache.expires > Date.now() && pageTokenDirectCache.map.size > 0) return;
     try {
-        const res = await fetch(`https://pages.fm/api/v1/pages?access_token=${userToken}&version=v1`);
+        const res = await fetch(`https://pages.fm/api/v1/pages?access_token=${userToken}&version=v1`, { signal: AbortSignal.timeout(20000) });
         const data = await res.json();
         const cat = data?.categorized || {};
         const all = [
@@ -1143,10 +1161,17 @@ async function loadPageTokensFromList(userToken: string): Promise<void> {
 }
 
 // Generate Pancake Page Access Token
+// forceRefresh=true: bust cache trước khi lấy — dùng khi token cũ vừa bị lỗi 105
+// (trước đây "làm mới" chỉ trả lại chính token hỏng còn TTL trong cache)
 async function generatePageAccessToken(
     pageId: string,
-    userToken: string
+    userToken: string,
+    forceRefresh = false
 ): Promise<string | null> {
+    if (forceRefresh) {
+        pageTokenDirectCache.map.delete(String(pageId));
+        pageTokenDirectCache.expires = 0;
+    }
     // 1) Ưu tiên token có sẵn trong /pages (endpoint generate đang lỗi server)
     await loadPageTokensFromList(userToken);
     const direct = pageTokenDirectCache.map.get(String(pageId));
@@ -1156,7 +1181,7 @@ async function generatePageAccessToken(
     try {
         const res = await fetch(
             `https://pages.fm/api/v1/pages/${pageId}/generate_page_access_token?access_token=${userToken}`,
-            { method: "POST" }
+            { method: "POST", signal: AbortSignal.timeout(20000) }
         );
         const data = await res.json();
         if (data.success && data.page_access_token) {
@@ -1187,7 +1212,7 @@ async function loadFacebookPages(userAccessToken: string): Promise<void> {
     
     // Pagination — lấy hết tất cả pages
     while (url) {
-        const res = await fetch(url);
+        const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
         const data = await res.json();
         if (!data.data) break;
         
@@ -1209,55 +1234,42 @@ async function loadFacebookPages(userAccessToken: string): Promise<void> {
 }
 
 async function getFacebookPageToken(pageId: string, userAccessToken: string, pageName?: string, configPageTokens?: Record<string, string>): Promise<string | null> {
-    // 1. Ưu tiên page_tokens trực tiếp từ config (không cần /me/accounts)
+    // ⚠️ AN TOÀN: chỉ trả token khớp ĐÚNG page (theo ID hoặc tên khớp chính xác).
+    // Tuyệt đối KHÔNG fallback sang "token đầu tiên bất kỳ" — trước đây điều đó
+    // khiến tin có thể được gửi TỪ NHẦM PAGE cho khách của page khác.
+
+    // 1. Ưu tiên page_tokens trực tiếp từ config — chỉ khi có đúng pageId
     if (configPageTokens) {
         const directToken = configPageTokens[pageId];
         if (directToken) {
             console.log(`[fb] Using direct page token from config for pageId=${pageId}`);
             return directToken;
         }
-        // Nếu config có page_tokens nhưng không có pageId cụ thể → dùng token đầu tiên làm fallback
-        const firstConfigToken = Object.values(configPageTokens)[0];
-        if (firstConfigToken) {
-            console.log(`[fb] pageId=${pageId} not in config page_tokens → using first config token as fallback`);
-            return firstConfigToken;
-        }
     }
 
     // 2. Fallback: lookup qua /me/accounts
     await loadFacebookPages(userAccessToken);
-    
+
     // Try by page ID first
     const byId = fbAllPagesCache.pages.get(pageId);
     if (byId) return byId;
-    
-    // Try by page name (fuzzy match — Pancake page name might match FB page name)
+
+    // Try by page name — CHỈ khớp tên chuẩn hoá CHÍNH XÁC (không partial match:
+    // "Talpha" từng khớp nhầm "Talpha 2")
     if (pageName) {
         const normName = pageName.toLowerCase().trim();
         const byName = fbAllPagesCache.byName.get(normName);
         if (byName) return byName;
-        
-        // Partial match
-        for (const [name, token] of fbAllPagesCache.byName) {
-            if (name.includes(normName) || normName.includes(name)) return token;
-        }
     }
-    
-    // 3. Last resort: try Graph API directly
+
+    // 3. Last resort: hỏi Graph API trực tiếp bằng đúng pageId
     try {
         const res = await fetch(`https://graph.facebook.com/v21.0/${pageId}?fields=access_token&access_token=${userAccessToken}`);
         const data = await res.json();
         if (data.access_token) return data.access_token;
     } catch { /* ignore */ }
-    
-    // 4. Use first available token from /me/accounts
-    const firstCachedToken = fbAllPagesCache.pages.values().next().value;
-    if (firstCachedToken) {
-        console.warn(`[fb] No exact match for pageId=${pageId} → using first cached token`);
-        return firstCachedToken;
-    }
-    
-    console.error(`[fb] No page token found for pageId=${pageId} name=${pageName}`);
+
+    console.error(`[fb] No page token found for pageId=${pageId} name=${pageName} — KHÔNG dùng token page khác`);
     return null;
 }
 
@@ -1295,6 +1307,7 @@ async function sendViaFacebookGraphAPI(
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
+                signal: AbortSignal.timeout(20000),
             });
             const data = await res.json();
 
@@ -1565,6 +1578,8 @@ async function uploadImageOnce(base64: string): Promise<string> {
 }
 
 export async function POST(req: NextRequest) {
+    const authError = requireAppKey(req);
+    if (authError) return authError;
     try {
         const config = loadConfig();
         
@@ -1748,6 +1763,14 @@ export async function POST(req: NextRequest) {
         // ═══ GỬI SONG SONG THEO LÔ (tăng tốc) ═══
         const SEND_CONCURRENCY = 16;  // số người gửi cùng lúc mỗi lô (giảm nếu bị rate limit #613)
         const BATCH_DELAY_MS = 80;    // nghỉ giữa các lô (ms)
+
+        // ═══ CIRCUIT BREAKER theo page ═══
+        // - pageBlockedErr: page dính lỗi chắc chắn fail cả page (121 hết gói cước,
+        //   #2022 FB chặn khi gửi TEXT) → khách còn lại của page fail nhanh, không tốn API call
+        // - pageImgBlocked2022: page bị #2022 khi gửi ẢNH → vẫn gửi text, bỏ qua ảnh
+        const pageBlockedErr = new Map<string, string>();
+        const pageImgBlocked2022 = new Set<string>();
+
         const sendOne = async (recipient: (typeof recipients)[number]): Promise<void> => {
           for (const _once of [0]) {
             // ═══ DEDUP CHECK: đã gửi cùng tin nhắn cho PSID này trong 2 phút? ═══
@@ -1760,8 +1783,15 @@ export async function POST(req: NextRequest) {
                 results.push({ psid: recipient.psid, name: recipient.name, success: false, error: `⚠️ Đã gửi ${secsAgo}s trước (chặn lặp)` });
                 continue;
             }
-            // Mark as sent TRƯỚC khi gửi
-            sentCache.set(dedupKey, Date.now());
+            // ═══ Page đã xác định fail cả page (121 / #2022 text) → fail nhanh ═══
+            const blockedReason = pageBlockedErr.get(recipient.pageFbId);
+            if (blockedReason) {
+                results.push({ psid: recipient.psid, name: recipient.name, success: false, error: blockedReason });
+                continue;
+            }
+            // Dedup chỉ đánh dấu SAU khi gửi thành công — trước đây đánh dấu TRƯỚC
+            // khiến khách gửi fail bị chặn retry oan trong 10 phút
+            const markSentOk = () => sentCache.set(dedupKey, Date.now());
             try {
                 const pageId = recipient.pageFbId;
                 const pageToken = pageTokens.get(pageId);
@@ -1786,37 +1816,25 @@ export async function POST(req: NextRequest) {
                         }
                     }
 
-                    // Images via Graph API — Direct binary upload (gửi ảnh trực tiếp)
-                    if (imageFiles.length > 0 || imageStrings.length > 0) {
-                        const filesToSend: { buffer: Buffer; type: string; name: string }[] = [];
-                        for (const f of imageFiles) {
-                            const arrBuf = await f.arrayBuffer();
-                            const ext = f.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
-                            filesToSend.push({ buffer: Buffer.from(arrBuf), type: f.type, name: `img_${filesToSend.length}.${ext}` });
-                        }
-                        for (const s of imageStrings) {
-                            if (s.startsWith('data:')) {
-                                const m = s.match(/^data:([^;]+);base64,(.+)$/);
-                                if (m) {
-                                    const ext = m[1].split('/')[1]?.replace('jpeg', 'jpg') || 'png';
-                                    filesToSend.push({ buffer: Buffer.from(m[2], 'base64'), type: m[1], name: `img_${filesToSend.length}.${ext}` });
-                                }
-                            }
-                        }
-                        for (const file of filesToSend) {
+                    // Images via Graph API — dùng imageBuffers ĐÃ NÉN sẵn ở trên
+                    // (trước đây đọc lại file gốc cho TỪNG khách — chậm và không nén)
+                    if (imageBuffers.length > 0) {
+                        for (const file of imageBuffers) {
                             try {
                                 const imgResult = await sendImageDirectViaFacebookGraphAPI(
                                     recipient.psid, file.buffer, file.name, file.type, fbPageToken
                                 );
                                 if (!imgResult.success) {
                                     console.warn(`[fb-img] Direct failed, fallback URL: ${imgResult.error}`);
-                                    // Fallback: freeimage.host → URL
-                                    const fallbackResult = await sendImageViaFacebookGraphAPI(
-                                        recipient.psid,
-                                        await uploadToFreeImageHost(file.buffer.toString('base64')),
-                                        fbPageToken
-                                    );
-                                    if (!fallbackResult.success) imgOk = false;
+                                    // Fallback: freeimage.host → URL (chỉ gửi khi upload thành công,
+                                    // không gọi FB với URL rỗng như trước)
+                                    const fallbackUrl = await uploadToFreeImageHost(file.buffer.toString('base64'));
+                                    if (fallbackUrl) {
+                                        const fallbackResult = await sendImageViaFacebookGraphAPI(recipient.psid, fallbackUrl, fbPageToken);
+                                        if (!fallbackResult.success) imgOk = false;
+                                    } else {
+                                        imgOk = false;
+                                    }
                                 }
                                 await new Promise(r => setTimeout(r, 300));
                             } catch { imgOk = false; }
@@ -1824,8 +1842,10 @@ export async function POST(req: NextRequest) {
                     }
 
                     if (textOk && imgOk) {
+                        markSentOk();
                         results.push({ psid: recipient.psid, name: recipient.name, success: true, via: 'fb_graph_api' });
                     } else if (textOk) {
+                        markSentOk();
                         results.push({ psid: recipient.psid, name: recipient.name, success: true, error: '⚠️ Text OK, ảnh lỗi', via: 'fb_graph_api' });
                     } else {
                         results.push({ psid: recipient.psid, name: recipient.name, success: false, error: 'Gửi thất bại', via: 'fb_graph_api' });
@@ -1840,6 +1860,7 @@ export async function POST(req: NextRequest) {
                     if (fbPageToken && message?.trim()) {
                         console.log(`[fb-fallback] No Pancake token for page ${pageId}, trying FB Graph API directly`);
                         const fbResult = await sendViaFacebookGraphAPI(recipient.psid, message.trim(), fbPageToken);
+                        if (fbResult.success) markSentOk();
                         results.push({ psid: recipient.psid, name: recipient.name, success: fbResult.success, error: fbResult.error, via: 'fb_graph_api' });
                     } else {
                         results.push({ psid: recipient.psid, name: recipient.name, success: false, error: `Không tạo được token cho page ${pageId}` });
@@ -1872,6 +1893,7 @@ export async function POST(req: NextRequest) {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify(reqBody),
+                        signal: AbortSignal.timeout(30000),
                     });
                     const sendText = await sendRes.text();
                     console.log(`[broadcast][DEBUG] Response status=${sendRes.status}, body=${sendText.slice(0, 500)}`);
@@ -1883,7 +1905,24 @@ export async function POST(req: NextRequest) {
                         // ═══ FB GRAPH API FALLBACK: Try HUMAN_AGENT tag (7 days window) ═══
                         const errMsg = String(sendData.original_error || sendData.message || sendData.error || '');
                         const errCode = sendData.error_code || sendData.code || '';
-                        
+
+                        // ═══ 121: page hết gói cước Pancake → fail nhanh CẢ PAGE ═══
+                        // (không thử FB fallback từng khách — trước đây mỗi khách tốn thêm 4 call tag vô ích)
+                        if (errCode === 121 || errCode === '121' || errMsg.toLowerCase().includes('gói cước') || errMsg.toLowerCase().includes('goi cuoc')) {
+                            const reason = `⛔ Page hết gói cước Pancake (lỗi 121) — bỏ qua toàn bộ khách của page này`;
+                            pageBlockedErr.set(pageId, reason);
+                            results.push({ psid: recipient.psid, name: recipient.name, success: false, error: reason, via: 'pancake' });
+                            continue;
+                        }
+                        // ═══ #2022 khi gửi TEXT: FB đang chặn page vì spam → NGỪNG cả page ═══
+                        // Gửi tiếp chỉ làm page bị chặn nặng/lâu hơn
+                        if (errCode === 2022 || errCode === '2022' || errMsg.includes('#2022') || errMsg.includes('(2022)')) {
+                            const reason = `⛔ Page đang bị Facebook chặn (#2022) — ngừng gửi cả page, thử lại sau vài giờ`;
+                            pageBlockedErr.set(pageId, reason);
+                            results.push({ psid: recipient.psid, name: recipient.name, success: false, error: reason, via: 'pancake' });
+                            continue;
+                        }
+
                         // ═══ EXPANDED: Detect ALL messaging errors that should trigger FB fallback ═══
                         // #10  = outside 24h window (OOW)
                         // #551 = "Người này hiện không có mặt" / user not available  
@@ -1980,7 +2019,11 @@ export async function POST(req: NextRequest) {
                 }
 
                 // 2. Gửi hình ảnh
-                if (imageBuffers.length > 0) {
+                if (imageBuffers.length > 0 && pageImgBlocked2022.has(pageId)) {
+                    // Page đã dính #2022 với ảnh trong đợt này → bỏ qua ảnh cho khách còn lại
+                    imageSuccess = false;
+                    console.warn(`[img] ⛔ Bỏ qua ảnh cho ${recipient.name} — page ${pageId} đang bị #2022`);
+                } else if (imageBuffers.length > 0) {
                     for (let imgIdx = 0; imgIdx < imageBuffers.length; imgIdx++) {
                         try {
                             const file = imageBuffers[imgIdx];
@@ -2002,7 +2045,7 @@ export async function POST(req: NextRequest) {
                                         uploadFd.append('file', blob, file.name);
 
                                         console.log(`[img] upload_contents (binary) img${imgIdx}${imgAttempt > 0 ? ` (thử lại ${imgAttempt})` : ''}...`);
-                                        const uploadRes = await fetch(uploadApiUrl, { method: "POST", body: uploadFd });
+                                        const uploadRes = await fetch(uploadApiUrl, { method: "POST", body: uploadFd, signal: AbortSignal.timeout(45000) });
                                         const uploadData = await uploadRes.json().catch(() => ({}));
                                         const contentId = uploadData?.id || uploadData?.content_id || uploadData?.data?.id || uploadData?.data?.content_id;
                                         const uCode = uploadData?.error_code || uploadData?.code;
@@ -2022,17 +2065,17 @@ export async function POST(req: NextRequest) {
                                             }
                                             const sCode = sendImgData.error_code || sendImgData.code || sendImgData.e_code;
                                             console.warn(`[img] binary content_ids fail:`, JSON.stringify(sendImgData).slice(0, 150));
-                                            if (sCode === 2022) { imgBlocked = true; console.warn(`[img] ⛔ Page bị FB chặn #2022 — ngừng thử ảnh`); break; }
+                                            if (sCode === 2022) { imgBlocked = true; pageImgBlocked2022.add(pageId); console.warn(`[img] ⛔ Page bị FB chặn #2022 — ngừng gửi ảnh cho CẢ page này trong đợt`); break; }
                                             if (sCode === 105 && crmToken) {
-                                                const fresh = await generatePageAccessToken(pageId, crmToken);
+                                                const fresh = await generatePageAccessToken(pageId, crmToken, true);
                                                 if (fresh) { pageTokens.set(pageId, fresh); console.log(`[img] 🔄 Làm mới token page ${pageId}, thử lại`); continue; }
                                             }
                                             if (imgAttempt < 2) { await new Promise(r => setTimeout(r, 700)); continue; }
                                         } else {
                                             console.warn(`[img] upload_contents không trả content_id:`, JSON.stringify(uploadData).slice(0, 120));
-                                            if (uCode === 2022) { imgBlocked = true; break; }
+                                            if (uCode === 2022) { imgBlocked = true; pageImgBlocked2022.add(pageId); break; }
                                             if (uCode === 105 && crmToken) {
-                                                const fresh = await generatePageAccessToken(pageId, crmToken);
+                                                const fresh = await generatePageAccessToken(pageId, crmToken, true);
                                                 if (fresh) { pageTokens.set(pageId, fresh); console.log(`[img] 🔄 Làm mới token page ${pageId}, thử lại`); continue; }
                                             }
                                             if (imgAttempt < 2) { await new Promise(r => setTimeout(r, 700)); continue; }
@@ -2101,8 +2144,10 @@ export async function POST(req: NextRequest) {
                 }
 
                 if (textSuccess && imageSuccess) {
+                    markSentOk();
                     results.push({ psid: recipient.psid, name: recipient.name, success: true, via: sentVia });
                 } else if (textSuccess && !imageSuccess) {
+                    markSentOk();
                     results.push({ psid: recipient.psid, name: recipient.name, success: true, error: "⚠️ Text OK, ảnh lỗi", via: sentVia });
                 } else {
                     results.push({ psid: recipient.psid, name: recipient.name, success: false, error: "Gửi thất bại", via: sentVia });

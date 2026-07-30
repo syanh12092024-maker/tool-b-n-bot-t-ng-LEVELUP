@@ -21,7 +21,8 @@ const SHOP_TIMEZONES: Record<string, { offset: number; label: string; flag: stri
     "Taiwan": { offset: 8, label: "Taipei", flag: "🇹🇼" },
 };
 
-const SCHEDULE_HOURS = [6, 11, 17, 21];
+// Cửa sổ gửi được: HUMAN_AGENT tag = 7 ngày kể từ tương tác cuối của khách
+const SEND_WINDOW_MS = 7 * 86400000;
 const SCHEDULE_LABELS: Record<number, string> = {
     6: "🌅 Sáng sớm",
     11: "☀️ Trưa",
@@ -138,21 +139,45 @@ interface BroadcastSchedule {
     recipientCount?: number;
 }
 
+// ─── Auth helper: server bật APP_ACCESS_KEY thì mọi request phải kèm key ─────
+const APP_KEY_STORAGE = "broadcast_app_key";
+function getAppKey(): string {
+    if (typeof window === "undefined") return "";
+    return localStorage.getItem(APP_KEY_STORAGE) || "";
+}
+async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+    const headers = new Headers(init?.headers || {});
+    const key = getAppKey();
+    if (key) headers.set("x-app-key", key);
+    const res = await fetch(input, { ...init, headers });
+    if (res.status === 401) {
+        const entered = window.prompt("🔒 Nhập mã truy cập tool (APP_ACCESS_KEY):");
+        if (entered && entered.trim()) {
+            localStorage.setItem(APP_KEY_STORAGE, entered.trim());
+            headers.set("x-app-key", entered.trim());
+            return fetch(input, { ...init, headers });
+        }
+    }
+    return res;
+}
+
 // ─── API helpers (thay thế localStorage) ─────────────────────────────────────
-async function fetchSchedulesFromAPI(): Promise<BroadcastSchedule[]> {
+// Trả về null khi lỗi mạng/server để caller GIỮ danh sách cũ thay vì ghi đè bằng []
+async function fetchSchedulesFromAPI(): Promise<BroadcastSchedule[] | null> {
     try {
-        const res = await fetch('/api/broadcast/schedule');
+        const res = await apiFetch('/api/broadcast/schedule');
+        if (!res.ok) return null;
         const data = await res.json();
         return data.schedules || [];
     } catch (err) {
         console.error('[broadcast] fetchSchedules error:', err);
-        return [];
+        return null;
     }
 }
 
 async function saveScheduleToAPI(schedule: BroadcastSchedule): Promise<boolean> {
     try {
-        const res = await fetch('/api/broadcast/schedule', {
+        const res = await apiFetch('/api/broadcast/schedule', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'save', schedule }),
@@ -163,7 +188,7 @@ async function saveScheduleToAPI(schedule: BroadcastSchedule): Promise<boolean> 
 
 async function deleteScheduleFromAPI(scheduleId: string): Promise<boolean> {
     try {
-        const res = await fetch('/api/broadcast/schedule', {
+        const res = await apiFetch('/api/broadcast/schedule', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'delete', scheduleId }),
@@ -174,7 +199,7 @@ async function deleteScheduleFromAPI(scheduleId: string): Promise<boolean> {
 
 async function toggleScheduleAPI(scheduleId: string): Promise<boolean> {
     try {
-        const res = await fetch('/api/broadcast/schedule', {
+        const res = await apiFetch('/api/broadcast/schedule', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'toggle', scheduleId }),
@@ -185,7 +210,7 @@ async function toggleScheduleAPI(scheduleId: string): Promise<boolean> {
 
 async function saveNoteAPI(scheduleId: string, note: string): Promise<boolean> {
     try {
-        const res = await fetch('/api/broadcast/schedule', {
+        const res = await apiFetch('/api/broadcast/schedule', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'save_note', scheduleId, note }),
@@ -215,14 +240,6 @@ export default function BroadcastTab() {
     const [media2, setMedia2] = useState<string[]>([]);
     const [media3, setMedia3] = useState<string[]>([]);
     const [media4, setMedia4] = useState<string[]>([]);
-    // Schedule states
-    const [scheduledHour, setScheduledHour] = useState<number | null>(null);
-    const [scheduleFireTime, setScheduleFireTime] = useState<Date | null>(null);
-    const [countdown, setCountdown] = useState("");
-    const [isPaused, setIsPaused] = useState(false);
-    const [remainingMs, setRemainingMs] = useState(0);
-    const scheduleTimerRef = useRef<NodeJS.Timeout | null>(null);
-    const countdownRef = useRef<NodeJS.Timeout | null>(null);
     const abortControllerRef = useRef<AbortController | null>(null);
     const [isLoadingShops, setIsLoadingShops] = useState(true);
     const [isLoadingCustomers, setIsLoadingCustomers] = useState(false);
@@ -237,6 +254,8 @@ export default function BroadcastTab() {
     const [filterTimeRange, setFilterTimeRange] = useState<'all' | '24h' | '7d' | '30d' | '90d'>('all');
     const [filterGender, setFilterGender] = useState<'all' | 'male' | 'female'>('all');
     const [filterActive, setFilterActive] = useState(false);
+    // Tuỳ chọn: loại khách vừa tương tác <24h (tránh bắn dồn dập khách đang chat)
+    const [excludeRecent24h, setExcludeRecent24h] = useState(false);
     const [pageSearch, setPageSearch] = useState("");
     const [isPageDropdownOpen, setIsPageDropdownOpen] = useState(false);
     const [visibleCount, setVisibleCount] = useState(100);
@@ -246,46 +265,38 @@ export default function BroadcastTab() {
     const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
     const [editNote, setEditNote] = useState("");
     const [scheduleToast, setScheduleToast] = useState<string | null>(null);
-    const sendingRef = useRef<Set<string>>(new Set());
     const [showSchedulePreview, setShowSchedulePreview] = useState(false);
     const [scheduledSegments, setScheduledSegments] = useState<Set<number>>(new Set());
-    const [isGlobalPaused, setIsGlobalPaused] = useState(false);
     const [isLoadingSchedules, setIsLoadingSchedules] = useState(false);
     // Bắn ngay 1 lịch: id của thẻ đang mở popup chọn đoạn + segIdx đang gửi
     const [fireNowId, setFireNowId] = useState<string | null>(null);
     const [firingSegKey, setFiringSegKey] = useState<string | null>(null);
     const fireAbortRef = useRef<AbortController | null>(null);
 
-    const toggleGlobalPause = () => {
-        // Global pause: toggle isActive for ALL schedules via API
-        setIsGlobalPaused(prev => {
-            const next = !prev;
-            setScheduleToast(next ? "⛔ Đã TẠM DỮNG tất cả lịch bắn bot" : "✅ Đã BẬT LẠI lịch bắn bot");
-            setTimeout(() => setScheduleToast(null), 3000);
-            // Toggle all schedules
-            schedules.forEach(s => {
-                if (next && s.isActive) toggleScheduleAPI(s.id);
-                if (!next && !s.isActive) toggleScheduleAPI(s.id);
-            });
-            refreshSchedules();
-            return next;
-        });
-    };
+    // ─── Toast helper: clear timer cũ để toast mới không bị xoá sớm ──────────
+    const toastTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const showToast = useCallback((msg: string, ms = 3000) => {
+        setScheduleToast(msg);
+        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = setTimeout(() => setScheduleToast(null), ms);
+    }, []);
+    useEffect(() => () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); }, []);
 
     // ─── Load schedules from BigQuery API on mount ────────────────────────────
     const refreshSchedules = useCallback(async () => {
         setIsLoadingSchedules(true);
         const list = await fetchSchedulesFromAPI();
-        setSchedules(list);
+        if (list) setSchedules(list);
+        else showToast("⚠️ Không tải được danh sách lịch — giữ danh sách cũ");
         setIsLoadingSchedules(false);
-    }, []);
+    }, [showToast]);
 
     useEffect(() => { refreshSchedules(); }, [refreshSchedules]);
 
     // ─── Auto-refresh schedules every 60s to see cron updates ─────────────────
     useEffect(() => {
         const interval = setInterval(() => {
-            fetchSchedulesFromAPI().then(list => setSchedules(list));
+            fetchSchedulesFromAPI().then(list => { if (list) setSchedules(list); });
         }, 60_000);
         return () => clearInterval(interval);
     }, []);
@@ -295,7 +306,7 @@ export default function BroadcastTab() {
 
     // Load shops
     useEffect(() => {
-        fetch("/api/broadcast")
+        apiFetch("/api/broadcast")
             .then((r) => r.json())
             .then((data) => { if (data.shops) setShops(data.shops); })
             .catch(console.error)
@@ -315,17 +326,20 @@ export default function BroadcastTab() {
             const url = shopId
                 ? `/api/broadcast?shopId=${shopId}&getPages=true`
                 : `/api/broadcast?getPages=true`;
-            const res = await fetch(url);
+            const res = await apiFetch(url);
             const data = await res.json();
             if (data.pages) {
                 setPages(data.pages);
+            } else if (data.error) {
+                showToast(`❌ Lỗi tải pages: ${data.error}`, 6000);
             }
         } catch (err) {
             console.error("Load pages error:", err);
+            showToast("❌ Không tải được danh sách page (lỗi mạng)", 6000);
         } finally {
             setIsLoadingPages(false);
         }
-    }, []);
+    }, [showToast]);
 
     // Auto-load ALL pages on mount (TH2: không cần chọn shop)
     useEffect(() => {
@@ -342,13 +356,14 @@ export default function BroadcastTab() {
         setSelectedIds(new Set());
         setSendResults(null);
         setCrmWarning(null);
+        setVisibleCount(100);
 
         try {
             let url = `/api/broadcast?page=${page}`;
             if (shopId) url += `&shopId=${shopId}`;
             if (pageFilter) url += `&pageFilter=${encodeURIComponent(pageFilter)}`;
 
-            const res = await fetch(url);
+            const res = await apiFetch(url);
             const data = await res.json();
 
             if (data.customers) {
@@ -363,14 +378,16 @@ export default function BroadcastTab() {
             } else if (data.error) {
                 console.error("Load customers error:", data.error);
                 setCustomers([]);
+                showToast(`❌ Lỗi tải khách: ${data.error}`, 8000);
             }
         } catch (err) {
             console.error("Load customers error:", err);
             setCustomers([]);
+            showToast("❌ Không tải được danh sách khách (lỗi mạng) — bấm 🔍 Lọc data để thử lại", 8000);
         } finally {
             setIsLoadingCustomers(false);
         }
-    }, []);
+    }, [showToast]);
 
     // Toggle selection
     const toggleSelect = (id: string) => {
@@ -393,19 +410,25 @@ export default function BroadcastTab() {
     };
 
     // ─── Filter logic ─────────────────────────────────────────────
+    // Khách ngoài cửa sổ 7 ngày chắc chắn lỗi #10 nên LUÔN ẩn khỏi danh sách gửi.
     const filteredCustomers = useMemo(() => {
         let result = customers;
 
-        // ═══ LUÔN loại khách tương tác trong vòng 24h (tránh bắn dồn dập) ═══
-        const now24h = Date.now();
-        const cutoff24h = now24h - 86400000; // 24h ago
-        const before24hFilter = result.length;
+        // ═══ LUÔN chỉ giữ khách trong cửa sổ 7 ngày ═══
+        const nowMs = Date.now();
+        const cutoffWindow = nowMs - SEND_WINDOW_MS;
         result = result.filter(c => {
             const t = new Date(c.lastInteraction || c.updatedAt).getTime();
-            return t < cutoff24h; // chỉ giữ khách tương tác > 24h trước
+            return Number.isFinite(t) && t >= cutoffWindow;
         });
-        if (result.length !== before24hFilter) {
-            console.log(`[filter] Loại ${before24hFilter - result.length} khách tương tác trong 24h (còn ${result.length})`);
+
+        // Tuỳ chọn: loại thêm khách vừa tương tác <24h
+        if (excludeRecent24h) {
+            const cutoff24h = nowMs - 86400000;
+            result = result.filter(c => {
+                const t = new Date(c.lastInteraction || c.updatedAt).getTime();
+                return t < cutoff24h;
+            });
         }
 
         // ═══ LUÔN áp dụng purchase filter (không cần filterActive) ═══
@@ -431,48 +454,29 @@ export default function BroadcastTab() {
             });
         }
 
-        // Gender filter (heuristic by name)
+        // Gender filter (heuristic by name — chỉ match tiền tố xưng hô,
+        // KHÔNG match tên riêng "Anh"/"Nam" vì rất phổ biến ở cả 2 giới)
         if (filterGender !== 'all') {
             result = result.filter(c => {
-                const name = c.customerName.toLowerCase();
+                const name = c.customerName.toLowerCase().trim();
                 if (filterGender === 'female') {
-                    return /^(chị|chi|ms|mrs|miss|cô|co|em gái|nữ|nu|bà|ba|madam)/i.test(name) || /\b(nữ|nu|chị|chi)\b/i.test(name);
+                    return /^(chị|chi|ms|mrs|miss|cô|co|nữ|nu|bà|ba|madam)\b/i.test(name);
                 }
-                return /^(anh|mr|ông|ong|bro|bác|bac)/i.test(name) || /\b(anh|nam)\b/i.test(name);
+                return /^(anh|mr|ông|ong|bro|bác|bac)\b/i.test(name);
             });
         }
 
         return result;
-    }, [customers, filterPurchase, filterTimeRange, filterGender, filterActive]);
+    }, [customers, filterPurchase, filterTimeRange, filterGender, filterActive, excludeRecent24h]);
 
-    // ═══ 24h WINDOW STATS: tính số khách trong/ngoài 24h ═══
-    const windowStats = useMemo(() => {
-        const now = Date.now();
-        const cutoff24h = now - 86400000; // 24h ago
-        let within = 0;
-        let outside = 0;
-        const selectedCustomers = customers.filter(c => selectedIds.has(c.id));
-        for (const c of selectedCustomers) {
+    // Số khách bị ẩn vì ngoài cửa sổ 7 ngày (hiển thị cho user biết, không âm thầm)
+    const outsideWindowCount = useMemo(() => {
+        const cutoff = Date.now() - SEND_WINDOW_MS;
+        return customers.filter(c => {
             const t = new Date(c.lastInteraction || c.updatedAt).getTime();
-            if (t >= cutoff24h) within++;
-            else outside++;
-        }
-        return { within, outside, total: selectedCustomers.length };
-    }, [customers, selectedIds]);
-
-    const selectOnly24h = () => {
-        const now = Date.now();
-        const cutoff24h = now - 86400000;
-        const ids = new Set(
-            filteredCustomers
-                .filter(c => {
-                    const t = new Date(c.lastInteraction || c.updatedAt).getTime();
-                    return t >= cutoff24h;
-                })
-                .map(c => c.id)
-        );
-        setSelectedIds(ids);
-    };
+            return !Number.isFinite(t) || t < cutoff;
+        }).length;
+    }, [customers]);
 
     const toggleSelectAll = () => {
         // ═══ FIX: Select All chỉ chọn filteredCustomers, không phải tất cả ═══
@@ -516,57 +520,13 @@ export default function BroadcastTab() {
     const shopName = selectedPage?.shopName || shops.find(s => s.shop_id === selectedShopId)?.name || "";
     const shopTz = SHOP_TIMEZONES[shopName] || { offset: 3, label: "UTC+3", flag: "🌍" };
 
-    // ─── Schedule actions ────────────────────────────────────────────────────
-    const handleSchedule = (hour: number) => {
-        if (!selectedPageId) {
-            setScheduleToast("⚠️ Chọn Page trước!");
-            setTimeout(() => setScheduleToast(null), 3000);
-            return;
-        }
-        const hasContent = messages.some(m => m.trim()) || mediaArrays.some(a => a.length > 0);
-        if (!hasContent) {
-            setScheduleToast("⚠️ Nhập ít nhất 1 tin nhắn trước!");
-            setTimeout(() => setScheduleToast(null), 3000);
-            return;
-        }
-        const pageName = pages.find(p => p.pageId === selectedPageId)?.name || selectedPageId;
-        const existing = schedules.find(s => s.shopId === selectedShopId && s.pageId === selectedPageId);
-        const tz = shopTz.offset;
-        const entry: BroadcastSchedule = {
-            id: existing?.id || `${selectedShopId}_${selectedPageId}_${Date.now()}`,
-            shopId: selectedShopId,
-            shopName: shopName,
-            pageId: selectedPageId,
-            pageName,
-            hour,
-            messages: messages.map(m => m.trim()),
-            filterPurchase,
-            filterTimeRange,
-            isActive: true,
-            createdAt: existing?.createdAt || new Date().toISOString(),
-            lastFiredAt: existing?.lastFiredAt || null,
-            nextFireAt: calcNextFireAt(hour, tz),
-            note: existing?.note,
-        };
-        saveScheduleToAPI(entry).then(ok => {
-            if (ok) {
-                refreshSchedules();
-                setScheduleToast(`✅ Đã lưu lịch ${SCHEDULE_LABELS[hour]} cho ${pageName}`);
-            } else {
-                setScheduleToast(`❌ Lỗi lưu lịch`);
-            }
-            setTimeout(() => setScheduleToast(null), 3000);
-        });
-    };
-
     // ─── Hẹn tất cả đoạn theo mapping cố định ───────────────────────────────
     // Đoạn 1 → 6h, Đoạn 2 → 11h, Đoạn 3 → 17h, Đoạn 4 → 21h
     const SEGMENT_HOUR_MAP = [6, 11, 17, 21];
 
     const handleScheduleAll = async () => {
         if (!selectedPageId) {
-            setScheduleToast("⚠️ Chọn Page trước!");
-            setTimeout(() => setScheduleToast(null), 3000);
+            showToast("⚠️ Chọn Page trước!");
             return;
         }
         // Tìm đoạn nào đã có nội dung
@@ -575,8 +535,7 @@ export default function BroadcastTab() {
             .filter(s => s.msg || s.media.length > 0);
 
         if (filledSegments.length === 0) {
-            setScheduleToast("⚠️ Nhập ít nhất 1 đoạn tin nhắn trước!");
-            setTimeout(() => setScheduleToast(null), 3000);
+            showToast("⚠️ Nhập ít nhất 1 đoạn tin nhắn trước!");
             return;
         }
 
@@ -585,7 +544,7 @@ export default function BroadcastTab() {
 
         // ═══ LƯU ẢNH: giữ thẳng base64 trong lịch (tự chứa, không phụ thuộc dịch vụ ngoài) ═══
         // fireSegment gửi base64 trực tiếp lên Facebook dạng bytes — không cần upload/host.
-        setScheduleToast("⏳ Đang lưu lịch...");
+        showToast("⏳ Đang lưu lịch...", 15000);
         const uploadedSegments = filledSegments.map((seg) => ({
             ...seg,
             mediaUrls: (seg.media || []).filter(Boolean), // base64 data URL hoặc http URL (chế độ Sửa) — giữ nguyên
@@ -627,21 +586,24 @@ export default function BroadcastTab() {
         saveScheduleToAPI(entry).then(ok => {
             if (ok) {
                 refreshSchedules();
-                setScheduleToast(`✅ Đã hẹn 1 lịch (${hourList}) cho ${pageName}`);
+                showToast(`✅ Đã hẹn 1 lịch (${hourList}) cho ${pageName}`, 4000);
             } else {
-                setScheduleToast(`❌ Lỗi lưu lịch`);
+                showToast(`❌ Lỗi lưu lịch — kiểm tra mạng rồi thử lại`, 4000);
             }
-            setTimeout(() => setScheduleToast(null), 4000);
         });
     };
 
     const toggleScheduleActive = async (id: string) => {
-        await toggleScheduleAPI(id);
+        const ok = await toggleScheduleAPI(id);
+        if (!ok) showToast("❌ Lỗi bật/tắt lịch — thử lại");
         refreshSchedules();
     };
 
     const handleDeleteSchedule = async (id: string) => {
-        await deleteScheduleFromAPI(id);
+        const s = schedules.find(x => x.id === id);
+        if (!confirm(`Xoá lịch "${s?.pageName || id}"?\n\nHành động này không hoàn tác được.`)) return;
+        const ok = await deleteScheduleFromAPI(id);
+        if (!ok) showToast("❌ Lỗi xoá lịch — thử lại");
         refreshSchedules();
     };
 
@@ -654,27 +616,26 @@ export default function BroadcastTab() {
         fireAbortRef.current = controller;
         setFiringSegKey(segKey);
         setFireNowId(null);
-        setScheduleToast(`⏳ Đang bắn ngay đoạn ${SCHEDULE_LABELS[hour] || hour + "h"}... (có thể bấm Huỷ bắn)`);
+        showToast(`⏳ Đang bắn ngay đoạn ${SCHEDULE_LABELS[hour] || hour + "h"}... (có thể bấm Huỷ bắn)`, 600000);
         try {
-            const res = await fetch(`/api/broadcast/cron?fire=${encodeURIComponent(s.id)}&seg=${segIdx}`, { signal: controller.signal });
+            const res = await apiFetch(`/api/broadcast/cron?fire=${encodeURIComponent(s.id)}&seg=${segIdx}`, { signal: controller.signal });
             const data = await res.json();
             if (data.ok && data.result) {
                 const r = data.result;
-                setScheduleToast(`✅ Đã bắn: ${r.success}/${r.recipients} khách thành công${r.errors ? ` (❌${r.errors} lỗi)` : ""}`);
+                showToast(`✅ Đã bắn: ${r.success}/${r.recipients} khách thành công${r.errors ? ` (❌${r.errors} lỗi)` : ""}`, 8000);
             } else {
-                setScheduleToast(`❌ Lỗi bắn ngay: ${data.error || "không rõ"}`);
+                showToast(`❌ Lỗi bắn ngay: ${data.error || "không rõ"}`, 8000);
             }
         } catch (err) {
             if (err instanceof Error && err.name === "AbortError") {
-                setScheduleToast(`⛔ Đã huỷ bắn (các tin đã gửi trước đó vẫn được gửi)`);
+                showToast(`⛔ Đã huỷ bắn (các tin đã gửi trước đó vẫn được gửi)`, 5000);
             } else {
-                setScheduleToast(`❌ Lỗi kết nối: ${err instanceof Error ? err.message : "unknown"}`);
+                showToast(`❌ Lỗi kết nối: ${err instanceof Error ? err.message : "unknown"}`, 5000);
             }
         } finally {
             fireAbortRef.current = null;
             setFiringSegKey(null);
             refreshSchedules();
-            setTimeout(() => setScheduleToast(null), 5000);
         }
     };
 
@@ -682,31 +643,13 @@ export default function BroadcastTab() {
     const handleCancelFire = () => {
         if (fireAbortRef.current) {
             fireAbortRef.current.abort();
-            setScheduleToast(`⛔ Đang huỷ bắn...`);
+            showToast(`⛔ Đang huỷ bắn...`);
         }
     };
 
-    // ✅ Auto-fire: gọi cron endpoint mỗi 5 phút để tự bắn khi đến giờ
-    // Hoạt động cả local và Vercel (Vercel Cron cũng gọi endpoint này)
-    useEffect(() => {
-        const fireCron = async () => {
-            try {
-                const res = await fetch('/api/broadcast/cron');
-                const data = await res.json();
-                if (data.fired > 0) {
-                    console.log(`[auto-fire] 🔥 Fired ${data.fired} segments`, data.results);
-                    refreshSchedules();
-                }
-            } catch (err) {
-                console.error('[auto-fire] Error:', err);
-            }
-        };
-        // Fire immediately on mount
-        fireCron();
-        // Then every 5 minutes
-        const interval = setInterval(fireCron, 5 * 60 * 1000);
-        return () => clearInterval(interval);
-    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    // ⚠️ Việc BẮN theo lịch do cron phía server đảm nhiệm (pm2 talpha-cron / Vercel Cron).
+    // Client KHÔNG tự gọi cron nữa — tránh nhiều tab cùng kích hoạt bắn trùng.
+    // Trạng thái lịch đã được auto-refresh mỗi 60s ở effect phía trên.
 
     const startEditNote = (s: BroadcastSchedule) => {
         setEditingScheduleId(s.id);
@@ -741,28 +684,8 @@ export default function BroadcastTab() {
         
         // Scroll lên đầu
         window.scrollTo({ top: 0, behavior: 'smooth' });
-        setScheduleToast(`✏️ Đang sửa lịch "${s.pageName}" — chỉnh sửa xong bấm "Hẹn lịch" để lưu`);
-        setTimeout(() => setScheduleToast(null), 5000);
+        showToast(`✏️ Đang sửa lịch "${s.pageName}" — chỉnh sửa xong bấm "Hẹn lịch" để lưu`, 5000);
     };
-
-    const handleCancelSchedule = () => {
-        if (scheduleTimerRef.current) clearTimeout(scheduleTimerRef.current);
-        if (countdownRef.current) clearInterval(countdownRef.current);
-        setScheduledHour(null);
-        setScheduleFireTime(null);
-        setCountdown("");
-        setIsPaused(false);
-        setRemainingMs(0);
-    };
-
-
-    // Cleanup timers on unmount
-    useEffect(() => {
-        return () => {
-            if (scheduleTimerRef.current) clearTimeout(scheduleTimerRef.current);
-            if (countdownRef.current) clearInterval(countdownRef.current);
-        };
-    }, []);
 
     // Send a specific box's message
     const sendingLockRef = useRef(false);
@@ -792,12 +715,22 @@ export default function BroadcastTab() {
         }
         const cooldownLeft = 10000 - (Date.now() - lastSentTimeRef.current);
         if (cooldownLeft > 0) {
-            console.warn(`[broadcast] BLOCKED: cooldown ${Math.ceil(cooldownLeft/1000)}s`);
+            showToast(`⏱️ Chờ ${Math.ceil(cooldownLeft / 1000)}s nữa rồi gửi tiếp (chống bấm trùng)`);
             return;
         }
         const msg = messages[boxIdx]?.trim();
         const boxMedia = mediaArrays[boxIdx];
         if (selectedIds.size === 0 || (!msg && boxMedia.length === 0)) return;
+
+        // ═══ Chỉ gửi cho filteredCustomers (đã lọc cửa sổ 7 ngày + bộ lọc) ═══
+        // Tính TRƯỚC khi khoá để có thể thoát sớm nếu rỗng
+        const allRecipients = filteredCustomers
+            .filter((c) => selectedIds.has(c.id))
+            .map((c) => ({ psid: c.psid, pageFbId: c.pageFbId, name: c.customerName, conversationId: c.id }));
+        if (allRecipients.length === 0) {
+            showToast("⚠️ Khách đã chọn không còn nằm trong bộ lọc hiện tại — chọn lại khách");
+            return;
+        }
 
         // Set ALL locks
         (window as unknown as Record<string, boolean>).__broadcastSending = true;
@@ -811,17 +744,31 @@ export default function BroadcastTab() {
         abortControllerRef.current = controller;
         const signal = controller.signal;
 
-        // ═══ FIX: Chỉ gửi cho filteredCustomers (đã loại khách mua hàng) ═══
-        const allRecipients = filteredCustomers
-            .filter((c) => selectedIds.has(c.id))
-            .map((c) => ({ psid: c.psid, pageFbId: c.pageFbId, name: c.customerName, conversationId: c.id }));
+        // Kết quả tích luỹ — khai báo ngoài try để khi HUỶ vẫn giữ được phần đã gửi
+        const allResults: SendResult[] = [];
 
         try {
             // Ảnh gửi trực tiếp base64 — server sẽ convert → FormData → Pancake
             const imageData: string[] = boxMedia.length > 0 ? boxMedia : [];
 
-            // ── GỬI TỪNG NGƯỜI 1 — CLIENT LOOP (AUTO-BATCH) ──
-            const allResults: SendResult[] = [];
+            // ═══ Chuẩn bị file ảnh MỘT LẦN (thay vì mỗi chunk) ═══
+            // Hỗ trợ cả data: URL lẫn http URL (từ chế độ "Sửa" lịch)
+            const imageFiles: File[] = [];
+            let skippedImages = 0;
+            for (let imgIdx = 0; imgIdx < imageData.length; imgIdx++) {
+                const imgStr = imageData[imgIdx];
+                try {
+                    const resp = await fetch(imgStr);
+                    const blob = await resp.blob();
+                    const ext = blob.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+                    imageFiles.push(new File([blob], `img_${imgIdx}.${ext}`, { type: blob.type }));
+                } catch {
+                    skippedImages++;
+                }
+            }
+            if (skippedImages > 0) {
+                showToast(`⚠️ ${skippedImages} ảnh không tải được (URL hỏng?) — vẫn gửi phần còn lại`, 6000);
+            }
 
             // Chia recipients thành batches
             const batches: typeof allRecipients[] = [];
@@ -857,47 +804,62 @@ export default function BroadcastTab() {
                         (idx >= chunkStart && idx < chunkStart + chunk.length) ? { ...item, status: 'sending' as const } : item));
                     setTimeout(() => logScrollRef.current?.scrollTo({ top: logScrollRef.current.scrollHeight, behavior: 'smooth' }), 50);
 
-                    try {
-                        let res: Response;
-                        if (imageData.length > 0) {
-                            const fd = new FormData();
-                            fd.append('recipients', JSON.stringify(chunk));
-                            fd.append('message', msg || '');
-                            for (let imgIdx = 0; imgIdx < imageData.length; imgIdx++) {
-                                const imgStr = imageData[imgIdx];
-                                if (imgStr.startsWith('data:')) {
-                                    const resp = await fetch(imgStr);
-                                    const blob = await resp.blob();
-                                    const ext = blob.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
-                                    fd.append('images', new File([blob], `img_${imgIdx}.${ext}`, { type: blob.type }));
-                                }
+                    // ═══ Gửi chunk với RETRY: tối đa 3 lần cho lỗi mạng / lỗi 5xx ═══
+                    let chunkResults: SendResult[] | null = null;
+                    let lastErr = '';
+                    for (let attempt = 0; attempt < 3 && !chunkResults; attempt++) {
+                        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+                        try {
+                            let res: Response;
+                            if (imageFiles.length > 0) {
+                                const fd = new FormData();
+                                fd.append('recipients', JSON.stringify(chunk));
+                                fd.append('message', msg || '');
+                                for (const f of imageFiles) fd.append('images', f);
+                                if (forceGraphAPI) fd.append('forceGraphAPI', 'true');
+                                res = await apiFetch("/api/broadcast", { method: "POST", body: fd, signal });
+                            } else {
+                                res = await apiFetch("/api/broadcast", {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ recipients: chunk, message: msg || '', forceGraphAPI }),
+                                    signal,
+                                });
                             }
-                            if (forceGraphAPI) fd.append('forceGraphAPI', 'true');
-                            res = await fetch("/api/broadcast", { method: "POST", body: fd, signal });
-                        } else {
-                            res = await fetch("/api/broadcast", {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ recipients: chunk, message: msg || '', forceGraphAPI }),
-                                signal,
-                            });
+                            if (res.ok) {
+                                const data = await res.json();
+                                chunkResults = (data.results || []) as SendResult[];
+                            } else {
+                                const data = await res.json().catch(() => ({} as { error?: string }));
+                                lastErr = data.error || `Server lỗi HTTP ${res.status}`;
+                                if (res.status < 500) break; // 4xx: retry vô ích
+                            }
+                        } catch (err) {
+                            if (err instanceof Error && err.name === 'AbortError') throw err;
+                            lastErr = 'Lỗi mạng';
                         }
-                        const data = await res.json();
-                        const results = data.results || [];
-                        allResults.push(...results);
-                        // Khớp kết quả về log theo psid (server trả về không đảm bảo thứ tự)
-                        const byPsid = new Map(results.map((r: SendResult) => [String(r.psid), r]));
+                        if (!chunkResults && attempt < 2) {
+                            await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+                        }
+                    }
+
+                    if (chunkResults) {
+                        // Khớp kết quả theo psid; người thiếu trong response → đánh lỗi rõ ràng
+                        // (không để "biến mất" khỏi thống kê như trước)
+                        const byPsid = new Map(chunkResults.map((r) => [String(r.psid), r]));
+                        const fullChunk: SendResult[] = chunk.map(rcp =>
+                            byPsid.get(String(rcp.psid)) ||
+                            { psid: rcp.psid, name: rcp.name, success: false, error: 'Server không trả kết quả cho khách này' });
+                        allResults.push(...fullChunk);
                         setSendingLog(prev => prev.map((item, idx) => {
                             if (idx < chunkStart || idx >= chunkStart + chunk.length) return item;
-                            const r = byPsid.get(String(chunk[idx - chunkStart].psid)) as SendResult | undefined;
-                            if (!r) return { ...item, status: 'error' as const, error: data.error || 'Không có kết quả' };
+                            const r = fullChunk[idx - chunkStart];
                             return { ...item, status: r.success ? 'success' as const : 'error' as const, error: r.error };
                         }));
-                    } catch (err) {
-                        if (err instanceof Error && err.name === 'AbortError') throw err;
-                        for (const rcp of chunk) allResults.push({ psid: rcp.psid, name: rcp.name, success: false, error: "Network error" });
+                    } else {
+                        for (const rcp of chunk) allResults.push({ psid: rcp.psid, name: rcp.name, success: false, error: lastErr });
                         setSendingLog(prev => prev.map((item, idx) =>
-                            (idx >= chunkStart && idx < chunkStart + chunk.length) ? { ...item, status: 'error' as const, error: 'Network error' } : item));
+                            (idx >= chunkStart && idx < chunkStart + chunk.length) ? { ...item, status: 'error' as const, error: lastErr } : item));
                     }
 
                     globalIdx += chunk.length;
@@ -926,10 +888,13 @@ export default function BroadcastTab() {
 
         } catch (err: unknown) {
             if (err instanceof Error && err.name === 'AbortError') {
-                setSendResults([{ psid: 'cancelled', name: 'System', success: false, error: '🚫 Đã huỷ gửi' }]);
+                // GIỮ kết quả đã gửi trước khi huỷ — không vứt bỏ như trước
+                setSendResults(allResults);
+                const sentOk = allResults.filter(r => r.success).length;
+                showToast(`⛔ Đã huỷ gửi — trước khi huỷ đã gửi thành công ${sentOk}/${allRecipients.length} tin`, 8000);
             } else {
                 console.error("Broadcast error:", err);
-                setSendResults([{ psid: "error", name: "System", success: false, error: "Network error" }]);
+                setSendResults(allResults.length > 0 ? allResults : [{ psid: "error", name: "System", success: false, error: "Network error" }]);
             }
         } finally {
             // Release ALL locks
@@ -966,8 +931,10 @@ export default function BroadcastTab() {
     const successCount = sendResults?.filter((r) => r.success).length || 0;
     const failCount = sendResults ? sendResults.length - successCount : 0;
 
-    // Batch progress UI helper
-    const progressPercent = batchProgress ? Math.round((batchProgress.sent / batchProgress.total) * 100) : 0;
+    // Batch progress UI helper (guard chia 0 → NaN%)
+    const progressPercent = batchProgress && batchProgress.total > 0
+        ? Math.round((batchProgress.sent / batchProgress.total) * 100)
+        : 0;
 
     return (
         <div className="space-y-4">
@@ -1064,12 +1031,24 @@ export default function BroadcastTab() {
                         onChange={(e) => { setFilterTimeRange(e.target.value as typeof filterTimeRange); setFilterActive(false); }}
                         className="rounded-xl border border-slate-200 bg-white px-2.5 py-2.5 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-violet-300/40 shadow-sm"
                     >
-                        <option value="all">Mọi thời gian</option>
+                        <option value="all">Trong 7 ngày (cửa sổ gửi)</option>
                         <option value="24h">24 giờ qua</option>
                         <option value="7d">7 ngày qua</option>
-                        <option value="30d">30 ngày qua</option>
-                        <option value="90d">90 ngày qua</option>
                     </select>
+                </div>
+
+                {/* Tuỳ chọn: loại khách vừa tương tác <24h */}
+                <div className="flex-shrink-0">
+                    <label className="text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-1 block">🕐 Chống spam</label>
+                    <label className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-2.5 py-2.5 text-xs text-slate-600 cursor-pointer shadow-sm select-none">
+                        <input
+                            type="checkbox"
+                            checked={excludeRecent24h}
+                            onChange={(e) => setExcludeRecent24h(e.target.checked)}
+                            className="accent-violet-600"
+                        />
+                        Bỏ KH &lt;24h
+                    </label>
                 </div>
 
                 {/* Lọc + Refresh + Count */}
@@ -1115,8 +1094,8 @@ export default function BroadcastTab() {
             <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
                 {/* Header */}
                 <div className="grid grid-cols-[80px_1fr_120px_80px_100px] gap-2 px-4 py-2.5 bg-slate-50 border-b border-slate-100 text-[10px] font-semibold text-slate-500 uppercase tracking-wider items-center">
-                    <button onClick={toggleSelectAll} className="flex items-center gap-1.5 px-1 py-0.5 rounded hover:bg-violet-50 transition-colors" title={`Chọn tất cả ${customers.length} khách`}>
-                        {selectedIds.size === customers.length && customers.length > 0
+                    <button onClick={toggleSelectAll} className="flex items-center gap-1.5 px-1 py-0.5 rounded hover:bg-violet-50 transition-colors" title={`Chọn tất cả ${filteredCustomers.length} khách trong bộ lọc`}>
+                        {selectedIds.size === filteredCustomers.length && filteredCustomers.length > 0
                             ? <CheckSquare className="h-4 w-4 text-violet-600 flex-shrink-0" />
                             : <Square className="h-4 w-4 text-slate-400 flex-shrink-0" />
                         }
@@ -1238,6 +1217,9 @@ export default function BroadcastTab() {
                     <div className="flex items-center justify-center px-4 py-2 bg-slate-50 border-t border-slate-100">
                         <span className="text-xs text-slate-400">
                             Hiển thị: {Math.min(visibleCount, filteredCustomers.length)} · Lọc: {filteredCustomers.length} · Tổng CRM: {totalCustomers} khách · Đã chọn: {selectedIds.size}
+                            {outsideWindowCount > 0 && (
+                                <span className="text-amber-500"> · Ẩn {outsideWindowCount} khách ngoài cửa sổ 7 ngày (gửi sẽ lỗi #10)</span>
+                            )}
                         </span>
                     </div>
                 )}
@@ -1364,15 +1346,15 @@ export default function BroadcastTab() {
 
                                 <button
                                     onClick={() => {
-                                        abortControllerRef.current?.abort();
-                                        sendingLockRef.current = false;
-                                        setIsSending(false);
-                                        setBatchProgress(null);
-                                        setSendResults([{ psid: 'cancelled', name: 'System', success: false, error: '🚫 Đã huỷ gửi tin nhắn' }]);
-                                        localStorage.setItem("broadcast_global_paused", "true");
-                                        setIsGlobalPaused(true);
+                                        // Chỉ abort — handleSendBox tự dọn lock/kết quả trong finally,
+                                        // không cưỡng chế mở khoá ở đây để tránh lệch trạng thái
+                                        if (abortControllerRef.current) {
+                                            abortControllerRef.current.abort();
+                                            showToast("⛔ Đang huỷ gửi...");
+                                        }
                                     }}
-                                    className="w-full rounded-lg px-2 py-1.5 text-center transition-all border-2 border-red-400 bg-red-50 text-red-700 text-[11px] font-bold hover:bg-red-100"
+                                    disabled={!isSending}
+                                    className="w-full rounded-lg px-2 py-1.5 text-center transition-all border-2 border-red-400 bg-red-50 text-red-700 text-[11px] font-bold hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed"
                                 >
                                     ⛔ Huỷ bắn
                                 </button>
@@ -1530,7 +1512,11 @@ export default function BroadcastTab() {
                             <span className="text-[11px] font-normal text-slate-400">({schedules.length} lịch)</span>
                         </h3>
                         <button
-                            onClick={async () => { for (const s of schedules) { await deleteScheduleFromAPI(s.id); } refreshSchedules(); }}
+                            onClick={async () => {
+                                if (!confirm(`⚠️ Xoá TẤT CẢ ${schedules.length} lịch bắn bot?\n\nHành động này không hoàn tác được.`)) return;
+                                for (const s of schedules) { await deleteScheduleFromAPI(s.id); }
+                                refreshSchedules();
+                            }}
                             className="text-[10px] text-red-400 hover:text-red-600 transition-colors"
                         >
                             Xoá tất cả

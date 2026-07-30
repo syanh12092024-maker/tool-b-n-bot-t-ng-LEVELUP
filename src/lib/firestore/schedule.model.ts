@@ -63,7 +63,12 @@ function localRead(): BroadcastSchedule[] {
 
 function localWrite(list: BroadcastSchedule[]): void {
     if (!fs.existsSync(LOCAL_DIR)) fs.mkdirSync(LOCAL_DIR, { recursive: true });
-    fs.writeFileSync(LOCAL_FILE, JSON.stringify(list, null, 2), "utf-8");
+    // Ghi ATOMIC: ghi file tạm rồi rename — crash giữa chừng không làm hỏng file chính.
+    // (read-modify-write trong saveSchedule/deleteSchedule đều là code sync nên
+    // không bị xen kẽ trong cùng 1 process Node)
+    const tmpFile = `${LOCAL_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2), "utf-8");
+    fs.renameSync(tmpFile, LOCAL_FILE);
 }
 
 if (USE_LOCAL) {

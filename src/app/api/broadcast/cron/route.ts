@@ -5,6 +5,17 @@ import {
     type BroadcastSchedule,
     type ScheduleSegment,
 } from "@/lib/firestore/schedule.model";
+import { requireCronAuth } from "@/lib/auth";
+
+// ═══ LOCK trong process: chặn 2 lượt cron chạy chồng nhau bắn cùng 1 segment ═══
+// (bổ sung cho guard sentAt/startedAt bên dưới — guard đó chỉ hiệu quả giữa các tick)
+const firingLocks = new Set<string>();
+
+// Headers cho self-call nội bộ (khi bật APP_ACCESS_KEY thì /api/broadcast yêu cầu key)
+function internalHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    const key = (process.env.APP_ACCESS_KEY || "").trim();
+    return key ? { ...extra, "x-app-key": key } : extra;
+}
 
 // ─── Timezone mapping (same as broadcast-tab) ─────────────────────────────────
 const SHOP_TIMEZONES: Record<string, number> = {
@@ -18,20 +29,17 @@ const SHOP_TIMEZONES: Record<string, number> = {
     Taiwan: 8,
 };
 
+// Cả 2 hàm dưới: dịch epoch theo offset rồi đọc bằng getter UTC —
+// kết quả KHÔNG phụ thuộc múi giờ của server (trước đây getTodayDateStr
+// cộng thêm getTimezoneOffset() rồi đọc toISOString → lệch ngày trên máy UTC+7)
 function getTodayDateStr(utcOffset: number): string {
-    const now = new Date();
-    const target = new Date(
-        now.getTime() + utcOffset * 3600000 + now.getTimezoneOffset() * 60000
-    );
+    const target = new Date(Date.now() + utcOffset * 3600000);
     return target.toISOString().slice(0, 10);
 }
 
 function getCurrentDecimal(utcOffset: number): number {
-    const now = new Date();
-    const target = new Date(
-        now.getTime() + utcOffset * 3600000 + now.getTimezoneOffset() * 60000
-    );
-    return target.getHours() + target.getMinutes() / 60;
+    const target = new Date(Date.now() + utcOffset * 3600000);
+    return target.getUTCHours() + target.getUTCMinutes() / 60;
 }
 
 // Purchase tag list for filtering
@@ -65,19 +73,10 @@ export async function GET(req: NextRequest) {
     };
 
     try {
-        // ── Security: Vercel sets CRON_SECRET header for cron jobs ──
-        // For manual trigger, accept ?secret= query param
-        const authHeader = req.headers.get("authorization");
-        const cronSecret = process.env.CRON_SECRET;
-        const querySecret = new URL(req.url).searchParams.get("secret");
-
-        if (cronSecret) {
-            const isVercelCron = authHeader === `Bearer ${cronSecret}`;
-            const isManualTrigger = querySecret === cronSecret;
-            if (!isVercelCron && !isManualTrigger) {
-                return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-            }
-        }
+        // ── Security: chấp nhận CRON_SECRET (Bearer/?secret=) hoặc x-app-key
+        // (để nút "Bắn ngay" trên UI vẫn hoạt động khi bật auth) ──
+        const authError = requireCronAuth(req);
+        if (authError) return authError;
 
         log("⏰ Cron job started");
 
@@ -122,7 +121,15 @@ export async function GET(req: NextRequest) {
             }
 
             log(`🚀 MANUAL FIRE Seg ${target.segIdx} (${target.hour}h) của lịch ${schedule.id}`);
+            const manualLockKey = `${schedule.id}_${target.segIdx}`;
+            if (firingLocks.has(manualLockKey)) {
+                return NextResponse.json({ ok: false, error: "Đoạn này đang được gửi — chờ xong rồi thử lại" }, { status: 409 });
+            }
+            firingLocks.add(manualLockKey);
             target.status = "sending";
+            // Ghi mốc BẮT ĐẦU gửi vào sentAt để guard "stuck >30 phút" đo đúng
+            // (trước đây sentAt chỉ set khi gửi XONG → segment đang gửi bị coi là kẹt 999' và bắn lại)
+            target.sentAt = new Date().toISOString();
             schedule.lastRunDate = todayStr;
             await saveSchedule(schedule);
 
@@ -135,6 +142,8 @@ export async function GET(req: NextRequest) {
                 target.error = err instanceof Error ? err.message : String(err);
                 await saveSchedule(schedule);
                 return NextResponse.json({ ok: false, error: target.error, logs }, { status: 500 });
+            } finally {
+                firingLocks.delete(manualLockKey);
             }
         }
 
@@ -204,9 +213,18 @@ export async function GET(req: NextRequest) {
                         continue;
                     }
 
+                    const lockKey = `${schedule.id}_${seg.segIdx}`;
+                    if (firingLocks.has(lockKey)) {
+                        log(`  🔒 Seg ${seg.segIdx} (${seg.hour}h) đang gửi ở lượt cron khác — skip`);
+                        continue;
+                    }
+
                     log(`  🔥 FIRING Seg ${seg.segIdx} (${seg.hour}h) — current time ${currentDecimal.toFixed(2)}h`);
 
+                    firingLocks.add(lockKey);
                     seg.status = "sending";
+                    // Ghi mốc BẮT ĐẦU gửi để guard "stuck >30 phút" đo đúng (fix double-fire)
+                    seg.sentAt = new Date().toISOString();
                     schedule.lastRunDate = todayStr;
                     await saveSchedule(schedule);
 
@@ -218,6 +236,8 @@ export async function GET(req: NextRequest) {
                         seg.status = "error";
                         seg.error = err instanceof Error ? err.message : String(err);
                         log(`  ❌ Seg ${seg.segIdx} error: ${seg.error}`);
+                    } finally {
+                        firingLocks.delete(lockKey);
                     }
 
                     await saveSchedule(schedule);
@@ -270,7 +290,7 @@ async function fireSegment(
     const custUrl = `${baseUrl}/api/broadcast?${shopParam}pageFilter=${schedule.pageId}`;
     log(`  📡 Fetching customers: ${custUrl.replace(/api_key=[^&]+/, "api_key=***")}`);
 
-    const custRes = await fetch(custUrl);
+    const custRes = await fetch(custUrl, { headers: internalHeaders(), signal: AbortSignal.timeout(240000) });
     const custData = await custRes.json();
     let allCust: Customer[] = custData.customers || [];
     log(`  👥 Got ${allCust.length} customers (raw)`);
@@ -289,18 +309,21 @@ async function fireSegment(
         log(`  🔍 After has_purchase filter: ${allCust.length}`);
     }
 
-    // 2b. Filter: bỏ khách tương tác trong vòng 1 ngày
+    // 2b. Filter theo cửa sổ gửi được: chỉ giữ khách tương tác trong 1–7 ngày.
+    // - >7 ngày: ngoài cửa sổ HUMAN_AGENT → chắc chắn lỗi #10, gửi chỉ tốn API call
+    // - <24h: khách đang chat, tránh bắn dồn dập
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     const beforeTimeFilter = allCust.length;
     allCust = allCust.filter((c) => {
         const lastDate = c.lastInteraction || c.updatedAt;
-        if (!lastDate) return true; // không có ngày → giữ lại
+        if (!lastDate) return false; // không có ngày → không xác định được cửa sổ → bỏ
         const ts = new Date(lastDate).getTime();
-        if (isNaN(ts)) return true; // ngày không hợp lệ → giữ lại
-        return ts < oneDayAgo; // chỉ giữ khách tương tác > 1 ngày trước
+        if (isNaN(ts)) return false;
+        return ts >= sevenDaysAgo && ts < oneDayAgo;
     });
     if (beforeTimeFilter !== allCust.length) {
-        log(`  🕐 After 24h filter: ${allCust.length} (removed ${beforeTimeFilter - allCust.length} recent)`);
+        log(`  🕐 After 1–7 day window filter: ${allCust.length} (removed ${beforeTimeFilter - allCust.length})`);
     }
 
     const recipients = allCust.map((c) => ({
@@ -324,6 +347,7 @@ async function fireSegment(
     const BATCH_SIZE = 8;
 
     let aborted = false;
+    let errLogged = 0;
     for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
         // ⛔ Huỷ bắn: client ngắt kết nối → dừng giữa các lô
         if (signal?.aborted) {
@@ -346,13 +370,14 @@ async function fireSegment(
                         // Media are URLs — send via JSON with images array
                         res = await fetch(`${baseUrl}/api/broadcast`, {
                             method: "POST",
-                            headers: { "Content-Type": "application/json" },
+                            headers: internalHeaders({ "Content-Type": "application/json" }),
                             body: JSON.stringify({
                                 recipients: [recipient],
                                 message: seg.message?.trim() || "",
                                 images: seg.media,
                                 forceGraphAPI: false,
                             }),
+                            signal: AbortSignal.timeout(120000),
                         });
                     } else {
                         // Media are base64 — use FormData
@@ -375,25 +400,29 @@ async function fireSegment(
 
                         res = await fetch(`${baseUrl}/api/broadcast`, {
                             method: "POST",
+                            headers: internalHeaders(),
                             body: formData,
+                            signal: AbortSignal.timeout(120000),
                         });
                     }
                 } else {
                     // Text only — use JSON
                     res = await fetch(`${baseUrl}/api/broadcast`, {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
+                        headers: internalHeaders({ "Content-Type": "application/json" }),
                         body: JSON.stringify({
                             recipients: [recipient],
                             message: seg.message,
                             forceGraphAPI: false,
                         }),
+                        signal: AbortSignal.timeout(120000),
                     });
                 }
 
                 const data = await res.json();
                 if (data.results?.[0]?.success) return true;
-                if (i === 0) log(`  ❌ ${recipient.name}: ${data.results?.[0]?.error || "Unknown"}`);
+                // Log tối đa 5 lỗi đầu của CẢ đợt (trước đây chỉ log lô đầu tiên)
+                if (errLogged < 5) { errLogged++; log(`  ❌ ${recipient.name}: ${data.results?.[0]?.error || "Unknown"}`); }
                 return false;
             } catch {
                 return false;

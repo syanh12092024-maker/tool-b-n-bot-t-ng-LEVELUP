@@ -5,9 +5,12 @@ import {
     deleteSchedule,
     type BroadcastSchedule,
 } from "@/lib/firestore/schedule.model";
+import { requireAppKey } from "@/lib/auth";
 
 // ─── GET: Lấy tất cả schedules từ BigQuery ───────────────────────────────────
-export async function GET() {
+export async function GET(req: NextRequest) {
+    const authError = requireAppKey(req);
+    if (authError) return authError;
     try {
         const schedules = await loadSchedules();
         return NextResponse.json({ schedules });
@@ -22,6 +25,8 @@ export async function GET() {
 
 // ─── POST: Lưu / Cập nhật / Xoá schedule ─────────────────────────────────────
 export async function POST(req: NextRequest) {
+    const authError = requireAppKey(req);
+    if (authError) return authError;
     try {
         const body = await req.json();
         const { action, schedule, scheduleId } = body as {
