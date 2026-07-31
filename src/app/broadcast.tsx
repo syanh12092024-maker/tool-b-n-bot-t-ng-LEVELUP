@@ -141,6 +141,22 @@ interface BroadcastSchedule {
 
 // ─── Auth helper: server bật APP_ACCESS_KEY thì mọi request phải kèm key ─────
 const APP_KEY_STORAGE = "broadcast_app_key";
+
+// Magic link: mở trang dạng /?key=XXX → tự lưu key vào trình duyệt rồi xoá khỏi
+// thanh địa chỉ. User chỉ cần bookmark link có key, không bao giờ phải nhập tay.
+// (Chạy ở module-level để key được lưu TRƯỚC mọi lời gọi API đầu tiên)
+if (typeof window !== "undefined") {
+    try {
+        const url = new URL(window.location.href);
+        const urlKey = url.searchParams.get("key");
+        if (urlKey && urlKey.trim()) {
+            localStorage.setItem(APP_KEY_STORAGE, urlKey.trim());
+            url.searchParams.delete("key");
+            window.history.replaceState({}, "", url.toString());
+        }
+    } catch { /* ignore */ }
+}
+
 function getAppKey(): string {
     if (typeof window === "undefined") return "";
     return localStorage.getItem(APP_KEY_STORAGE) || "";
