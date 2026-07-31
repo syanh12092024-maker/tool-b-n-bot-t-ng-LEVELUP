@@ -9,7 +9,8 @@ function loadEnvLocal() {
         const txt = fs.readFileSync(new URL("./.env.local", import.meta.url), "utf-8");
         for (const line of txt.split("\n")) {
             const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-            if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+            // strip dấu nháy bao quanh để khớp cách Next.js (dotenv) đọc giá trị
+            if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim().replace(/^(['"])(.*)\1$/, "$2");
         }
     } catch { /* không có .env.local cũng không sao */ }
 }

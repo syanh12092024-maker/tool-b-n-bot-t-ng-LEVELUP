@@ -126,23 +126,33 @@ export async function GET(req: NextRequest) {
                 return NextResponse.json({ ok: false, error: "Đoạn này đang được gửi — chờ xong rồi thử lại" }, { status: 409 });
             }
             firingLocks.add(manualLockKey);
-            target.status = "sending";
-            // Ghi mốc BẮT ĐẦU gửi vào sentAt để guard "stuck >30 phút" đo đúng
-            // (trước đây sentAt chỉ set khi gửi XONG → segment đang gửi bị coi là kẹt 999' và bắn lại)
-            target.sentAt = new Date().toISOString();
-            schedule.lastRunDate = todayStr;
-            await saveSchedule(schedule);
-
             try {
-                const fired = await fireSegment(schedule, target, todayStr, log, req.signal);
+                // Sang ngày mới → reset các seg khác TRƯỚC khi ghi lastRunDate=hôm nay,
+                // nếu không chúng kẹt status "sent" của hôm trước và auto-fire bỏ qua cả ngày
+                if (!schedule.lastRunDate || schedule.lastRunDate !== todayStr) {
+                    for (const seg of allSegs) {
+                        seg.status = "pending";
+                        seg.error = undefined;
+                        seg.sentAt = undefined;
+                    }
+                }
+                target.status = "sending";
+                // Ghi mốc BẮT ĐẦU gửi vào sentAt để guard "stuck >30 phút" đo đúng
+                // (trước đây sentAt chỉ set khi gửi XONG → segment đang gửi bị coi là kẹt 999' và bắn lại)
+                target.sentAt = new Date().toISOString();
+                schedule.lastRunDate = todayStr;
                 await saveSchedule(schedule);
+
+                const fired = await fireSegment(schedule, target, todayStr, log, req.signal);
+                await persistScheduleAfterFire(schedule, target, log);
                 return NextResponse.json({ ok: true, fired: 1, manual: true, result: fired, logs });
             } catch (err) {
                 target.status = "error";
                 target.error = err instanceof Error ? err.message : String(err);
-                await saveSchedule(schedule);
+                await persistScheduleAfterFire(schedule, target, log);
                 return NextResponse.json({ ok: false, error: target.error, logs }, { status: 500 });
             } finally {
+                // finally đảm bảo lock không leak kể cả khi saveSchedule throw
                 firingLocks.delete(manualLockKey);
             }
         }
@@ -173,14 +183,19 @@ export async function GET(req: NextRequest) {
 
             log(`🏪 ${schedule.shopName} | Page: ${schedule.pageName} | TZ: UTC+${tz} | Now: ${currentDecimal.toFixed(2)}h | Today: ${todayStr}`);
 
-            for (const seg of schedule.segments) {
-                // Reset status if new day (or no lastRunDate yet)
-                if (!schedule.lastRunDate || schedule.lastRunDate !== todayStr) {
+            // Sang ngày mới → reset TẤT CẢ segments MỘT LƯỢT trước khi xử lý.
+            // (Trước đây reset từng seg bên trong vòng lặp, nhưng vòng lặp `break`
+            // ngay sau khi bắn seg đầu tiên → các seg đứng sau không bao giờ được
+            // reset, từ ngày thứ 2 chúng kẹt status "sent" của hôm trước → không bắn)
+            if (!schedule.lastRunDate || schedule.lastRunDate !== todayStr) {
+                for (const seg of schedule.segments) {
                     seg.status = "pending";
                     seg.error = undefined;
                     seg.sentAt = undefined;
                 }
+            }
 
+            for (const seg of schedule.segments) {
                 // Skip already sent today
                 if (seg.status === "sent" && schedule.lastRunDate === todayStr) {
                     log(`  ✅ Seg ${seg.segIdx} (${seg.hour}h) already sent today`);
@@ -222,13 +237,13 @@ export async function GET(req: NextRequest) {
                     log(`  🔥 FIRING Seg ${seg.segIdx} (${seg.hour}h) — current time ${currentDecimal.toFixed(2)}h`);
 
                     firingLocks.add(lockKey);
-                    seg.status = "sending";
-                    // Ghi mốc BẮT ĐẦU gửi để guard "stuck >30 phút" đo đúng (fix double-fire)
-                    seg.sentAt = new Date().toISOString();
-                    schedule.lastRunDate = todayStr;
-                    await saveSchedule(schedule);
-
                     try {
+                        seg.status = "sending";
+                        // Ghi mốc BẮT ĐẦU gửi để guard "stuck >30 phút" đo đúng (fix double-fire)
+                        seg.sentAt = new Date().toISOString();
+                        schedule.lastRunDate = todayStr;
+                        await saveSchedule(schedule);
+
                         const fired = await fireSegment(schedule, seg, todayStr, log);
                         results.push(fired);
                         totalFired++;
@@ -237,10 +252,13 @@ export async function GET(req: NextRequest) {
                         seg.error = err instanceof Error ? err.message : String(err);
                         log(`  ❌ Seg ${seg.segIdx} error: ${seg.error}`);
                     } finally {
+                        // finally đảm bảo lock không leak kể cả khi saveSchedule throw
                         firingLocks.delete(lockKey);
                     }
 
-                    await saveSchedule(schedule);
+                    // Ghi KẾT QUẢ trên bản schedule MỚI NHẤT — không ghi đè thao tác
+                    // user vừa làm trên UI (Dừng, sửa note...) trong lúc đang gửi
+                    await persistScheduleAfterFire(schedule, seg, log);
 
                     // Only fire 1 segment per schedule per cron run to avoid timeout
                     break;
@@ -269,6 +287,42 @@ export async function GET(req: NextRequest) {
             },
             { status: 500 }
         );
+    }
+}
+
+// ─── Ghi kết quả gửi mà KHÔNG ghi đè thao tác UI đồng thời ────────────────────
+// fireSegment chạy nhiều phút; trong lúc đó user có thể bấm "Dừng" / sửa note
+// trên UI. Nếu save nguyên object snapshot cũ thì các thay đổi đó bị revert
+// (vd: campaign vừa tắt tự bật lại). Vì vậy: load bản MỚI NHẤT, chỉ chép phần
+// kết quả gửi của đúng segment vừa bắn vào rồi save.
+async function persistScheduleAfterFire(
+    local: BroadcastSchedule,
+    seg: ScheduleSegment,
+    log: (msg: string) => void
+): Promise<void> {
+    try {
+        const all = await loadSchedules();
+        const fresh = all.find((s) => s.id === local.id);
+        if (!fresh) {
+            log(`  ⚠️ Lịch ${local.id} đã bị xoá trong lúc gửi — bỏ qua ghi kết quả`);
+            return;
+        }
+        fresh.lastFiredAt = local.lastFiredAt;
+        fresh.lastRunDate = local.lastRunDate;
+        fresh.firedDates = local.firedDates;
+        if (!fresh.segments?.length) fresh.segments = local.segments; // lịch cũ chưa có segments
+        const freshSeg = (fresh.segments || []).find((x) => x.segIdx === seg.segIdx);
+        if (freshSeg && freshSeg !== seg) {
+            freshSeg.status = seg.status;
+            freshSeg.error = seg.error;
+            freshSeg.sentAt = seg.sentAt;
+            freshSeg.totalRecipients = seg.totalRecipients;
+            freshSeg.successCount = seg.successCount;
+            freshSeg.errorCount = seg.errorCount;
+        }
+        await saveSchedule(fresh);
+    } catch (e) {
+        log(`  ⚠️ Ghi kết quả sau khi bắn lỗi: ${e instanceof Error ? e.message : String(e)}`);
     }
 }
 

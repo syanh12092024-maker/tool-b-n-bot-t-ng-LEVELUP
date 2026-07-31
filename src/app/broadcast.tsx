@@ -161,19 +161,45 @@ function getAppKey(): string {
     if (typeof window === "undefined") return "";
     return localStorage.getItem(APP_KEY_STORAGE) || "";
 }
-async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
-    const headers = new Headers(init?.headers || {});
-    const key = getAppKey();
-    if (key) headers.set("x-app-key", key);
-    const res = await fetch(input, { ...init, headers });
-    if (res.status === 401) {
-        const entered = window.prompt("🔒 Nhập mã truy cập tool (APP_ACCESS_KEY):");
-        if (entered && entered.trim()) {
-            localStorage.setItem(APP_KEY_STORAGE, entered.trim());
-            headers.set("x-app-key", entered.trim());
-            return fetch(input, { ...init, headers });
-        }
+// Single-flight prompt: nhiều request cùng nhận 401 (lúc mount bắn 3 request
+// song song) chỉ hiện MỘT hộp thoại nhập mã, không hỏi 3 lần liên tiếp
+let keyPromptPromise: Promise<string | null> | null = null;
+function promptForKey(): Promise<string | null> {
+    if (!keyPromptPromise) {
+        keyPromptPromise = Promise.resolve()
+            .then(() => {
+                // Request song song có thể đã lưu key xong trong lúc mình chờ
+                const existing = getAppKey();
+                if (existing) return existing;
+                const entered = window.prompt("🔒 Nhập mã truy cập tool (APP_ACCESS_KEY):");
+                if (entered && entered.trim()) {
+                    localStorage.setItem(APP_KEY_STORAGE, entered.trim());
+                    return entered.trim();
+                }
+                return null;
+            })
+            .finally(() => { keyPromptPromise = null; });
     }
+    return keyPromptPromise;
+}
+
+async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+    const attempt = (key: string) => {
+        const headers = new Headers(init?.headers || {});
+        if (key) headers.set("x-app-key", key);
+        return fetch(input, { ...init, headers });
+    };
+    const usedKey = getAppKey();
+    let res = await attempt(usedKey);
+    if (res.status !== 401) return res;
+    // Key có thể vừa được request khác lưu → thử lại với key mới nhất trước khi hỏi
+    const latest = getAppKey();
+    if (latest && latest !== usedKey) {
+        res = await attempt(latest);
+        if (res.status !== 401) return res;
+    }
+    const entered = await promptForKey();
+    if (entered) return attempt(entered);
     return res;
 }
 
@@ -567,8 +593,11 @@ export default function BroadcastTab() {
         }));
 
         // ═══ TẠO 1 ENTRY DUY NHẤT chứa tất cả segments ═══
-        const scheduleId = `${selectedShopId}_${selectedPageId}_combined`;
-        const existing = schedules.find(s => s.id === scheduleId);
+        // Tìm lịch cũ theo PAGE (không phụ thuộc shopId) — tránh việc cùng 1 page
+        // tồn tại 2 lịch song song (id khác nhau do lúc hẹn có/không chọn shop)
+        // → cron bắn cả 2 → khách nhận tin đôi
+        const existing = schedules.find(x => x.pageId === selectedPageId && x.id.endsWith('_combined'));
+        const scheduleId = existing?.id || `${selectedShopId}_${selectedPageId}_combined`;
         const segs: ScheduleSegment[] = uploadedSegments.map(seg => ({
             segIdx: seg.idx,
             hour: SEGMENT_HOUR_MAP[seg.idx],
@@ -680,19 +709,24 @@ export default function BroadcastTab() {
 
     // ═══ SỬA NỘI DUNG: Load schedule vào 4 ô message + media ═══
     const handleEditScheduleContent = (s: BroadcastSchedule) => {
-        // Load messages vào 4 ô
-        const msgs = s.messages || [];
-        setMsg1(msgs[0] || '');
-        setMsg2(msgs[1] || '');
-        setMsg3(msgs[2] || '');
-        setMsg4(msgs[3] || '');
-        
-        // Load media vào 4 ô
+        // Map theo segIdx chứ KHÔNG theo vị trí mảng — s.messages/segments chỉ chứa
+        // các đoạn CÓ nội dung (vd chỉ Đoạn 2 + Đoạn 4), nếu đổ theo vị trí thì
+        // nội dung 11h nhảy vào ô Đoạn 1 (6h) → lưu lại là lệch hết khung giờ
+        setMessages.forEach(setter => setter(''));
+        setMediaArrays.forEach(setter => setter([]));
         const segs = s.segments || [];
-        setMedia1(segs[0]?.media || []);
-        setMedia2(segs[1]?.media || []);
-        setMedia3(segs[2]?.media || []);
-        setMedia4(segs[3]?.media || []);
+        if (segs.length > 0) {
+            for (const seg of segs) {
+                const i = seg.segIdx ?? 0;
+                if (i >= 0 && i < 4) {
+                    setMessages[i](seg.message || '');
+                    setMediaArrays[i](seg.media || []);
+                }
+            }
+        } else {
+            // Lịch cũ chưa có segments: messages đủ 4 phần tử theo đúng vị trí ô
+            (s.messages || []).forEach((m, i) => { if (i < 4) setMessages[i](m || ''); });
+        }
         
         // Select đúng shop + page
         if (s.shopId && s.shopId !== selectedShopId) setSelectedShopId(s.shopId);

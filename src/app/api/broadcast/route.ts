@@ -1229,7 +1229,9 @@ async function loadFacebookPages(userAccessToken: string): Promise<void> {
         url = data.paging?.next || '';
     }
     
-    fbAllPagesCache.expires = Date.now() + 3600000; // Cache 1 giờ
+    // Chỉ cache 1 giờ khi CÓ kết quả; token hỏng/trả rỗng → thử lại sau 1 phút
+    // (trước đây cache rỗng suốt 1 giờ làm FB fallback chết cả tiếng)
+    fbAllPagesCache.expires = Date.now() + (pageCount > 0 ? 3600000 : 60000);
     console.log(`[fb] Loaded ${pageCount} Facebook page tokens`);
 }
 
@@ -1527,10 +1529,44 @@ async function uploadToImgBB(base64: string): Promise<string> {
     }
 }
 
+// ═══ CIRCUIT BREAKER CACHE (cấp module — sống qua NHIỀU request) ═══
+// Frontend gửi 16 người/request, cron gửi 1 người/request — nếu chỉ nhớ trong
+// 1 request thì page lỗi 121/#2022 vẫn bị gọi lại ở mỗi request kế tiếp.
+// TTL 30 phút: tự thử lại sau khi hết hạn (phòng khi user đã mua gói cước / FB gỡ chặn).
+const PAGE_BLOCK_TTL_MS = 30 * 60 * 1000;
+const pageBlockCache = new Map<string, { reason: string; until: number }>(); // fail cả page
+const pageImgBlockCache = new Map<string, number>(); // chỉ chặn ảnh, vẫn gửi text (value = until)
+
+function getPageBlock(pageId: string): string | null {
+    const b = pageBlockCache.get(pageId);
+    if (!b) return null;
+    if (b.until < Date.now()) { pageBlockCache.delete(pageId); return null; }
+    return b.reason;
+}
+function setPageBlock(pageId: string, reason: string): void {
+    pageBlockCache.set(pageId, { reason, until: Date.now() + PAGE_BLOCK_TTL_MS });
+}
+function isPageImgBlocked(pageId: string): boolean {
+    const until = pageImgBlockCache.get(pageId);
+    if (!until) return false;
+    if (until < Date.now()) { pageImgBlockCache.delete(pageId); return false; }
+    return true;
+}
+function blockPageImg(pageId: string): void {
+    pageImgBlockCache.set(pageId, Date.now() + PAGE_BLOCK_TTL_MS);
+}
+
 // ═══ SERVER-SIDE DEDUP CACHE ═══
 // Chống gửi lặp: từ chối gửi cùng PSID + cùng message trong 10 phút
 const DEDUP_WINDOW_MS = 10 * 60 * 1000; // 10 phút (tăng từ 2 phút để chặn retry lặp)
 const sentCache = new Map<string, number>(); // psid -> timestamp
+
+// ═══ IN-FLIGHT GUARD (cấp module) ═══
+// Dedup chỉ đánh dấu SAU khi gửi xong → nếu client timeout (vd nginx 504 sau 60s)
+// và retry TRONG LÚC request cũ vẫn đang gửi thì dedup trượt → gửi trùng.
+// Guard này chặn đúng cửa sổ đó: khách đang được gửi ở request khác → từ chối ngay.
+const inFlightSends = new Map<string, number>(); // dedupKey -> startedAt
+const INFLIGHT_TTL_MS = 2 * 60 * 1000; // safety TTL phòng khi delete không chạy
 
 function cleanupDedup() {
     const now = Date.now();
@@ -1540,6 +1576,14 @@ function cleanupDedup() {
     // Cleanup image cache too (30 min TTL)
     for (const [key, entry] of imageUrlCache) {
         if (now - entry.ts > 30 * 60 * 1000) imageUrlCache.delete(key);
+    }
+    // Dọn cache danh sách khách hết TTL (mỗi entry có thể chứa tới 20k record)
+    for (const [key, entry] of crmConvCache) {
+        if (now - entry.ts > CRM_CONV_CACHE_MS) crmConvCache.delete(key);
+    }
+    // Dọn in-flight marker quá hạn (safety — bình thường finally đã xoá)
+    for (const [key, ts] of inFlightSends) {
+        if (now - ts > INFLIGHT_TTL_MS) inFlightSends.delete(key);
     }
 }
 
@@ -1758,24 +1802,29 @@ export async function POST(req: NextRequest) {
         }
 
         // Create message fingerprint for dedup (different messages = different segments = OK)
-        const msgFingerprint = message ? message.slice(0, 50) : '';
+        // Tin CHỈ-ẢNH: dùng kích thước ảnh làm dấu vân — trước đây là chuỗi rỗng nên
+        // 2 segment ảnh-only KHÁC nhau bị chung dedup key, segment 2 bị chặn oan
+        const msgFingerprint = message?.trim()
+            ? message.slice(0, 50)
+            : imageBuffers.map(b => b.buffer.length).join(',');
         
         // ═══ GỬI SONG SONG THEO LÔ (tăng tốc) ═══
         const SEND_CONCURRENCY = 16;  // số người gửi cùng lúc mỗi lô (giảm nếu bị rate limit #613)
         const BATCH_DELAY_MS = 80;    // nghỉ giữa các lô (ms)
 
-        // ═══ CIRCUIT BREAKER theo page ═══
-        // - pageBlockedErr: page dính lỗi chắc chắn fail cả page (121 hết gói cước,
-        //   #2022 FB chặn khi gửi TEXT) → khách còn lại của page fail nhanh, không tốn API call
-        // - pageImgBlocked2022: page bị #2022 khi gửi ẢNH → vẫn gửi text, bỏ qua ảnh
-        const pageBlockedErr = new Map<string, string>();
-        const pageImgBlocked2022 = new Set<string>();
-
         const sendOne = async (recipient: (typeof recipients)[number]): Promise<void> => {
+          // Key bao gồm message fingerprint để segment khác nhau KHÔNG bị chặn
+          const dedupKey = `${recipient.psid}_${recipient.pageFbId}_${msgFingerprint}`;
+          // ═══ IN-FLIGHT: khách này đang được gửi ở request khác → chặn trùng ═══
+          const inflightTs = inFlightSends.get(dedupKey);
+          if (inflightTs && Date.now() - inflightTs < INFLIGHT_TTL_MS) {
+              results.push({ psid: recipient.psid, name: recipient.name, success: false, error: "⚠️ Đang được gửi ở request khác (chặn trùng)" });
+              return;
+          }
+          inFlightSends.set(dedupKey, Date.now());
+          try {
           for (const _once of [0]) {
-            // ═══ DEDUP CHECK: đã gửi cùng tin nhắn cho PSID này trong 2 phút? ═══
-            // Key bao gồm message fingerprint để segment khác nhau KHÔNG bị chặn
-            const dedupKey = `${recipient.psid}_${recipient.pageFbId}_${msgFingerprint}`;
+            // ═══ DEDUP CHECK: đã gửi cùng tin nhắn cho PSID này trong 10 phút? ═══
             if (sentCache.has(dedupKey)) {
                 const lastSent = sentCache.get(dedupKey)!;
                 const secsAgo = Math.round((Date.now() - lastSent) / 1000);
@@ -1784,7 +1833,7 @@ export async function POST(req: NextRequest) {
                 continue;
             }
             // ═══ Page đã xác định fail cả page (121 / #2022 text) → fail nhanh ═══
-            const blockedReason = pageBlockedErr.get(recipient.pageFbId);
+            const blockedReason = getPageBlock(recipient.pageFbId);
             if (blockedReason) {
                 results.push({ psid: recipient.psid, name: recipient.name, success: false, error: blockedReason });
                 continue;
@@ -1909,8 +1958,8 @@ export async function POST(req: NextRequest) {
                         // ═══ 121: page hết gói cước Pancake → fail nhanh CẢ PAGE ═══
                         // (không thử FB fallback từng khách — trước đây mỗi khách tốn thêm 4 call tag vô ích)
                         if (errCode === 121 || errCode === '121' || errMsg.toLowerCase().includes('gói cước') || errMsg.toLowerCase().includes('goi cuoc')) {
-                            const reason = `⛔ Page hết gói cước Pancake (lỗi 121) — bỏ qua toàn bộ khách của page này`;
-                            pageBlockedErr.set(pageId, reason);
+                            const reason = `⛔ Page hết gói cước Pancake (lỗi 121) — bỏ qua toàn bộ khách của page này (tự thử lại sau 30')`;
+                            setPageBlock(pageId, reason);
                             results.push({ psid: recipient.psid, name: recipient.name, success: false, error: reason, via: 'pancake' });
                             continue;
                         }
@@ -1918,7 +1967,7 @@ export async function POST(req: NextRequest) {
                         // Gửi tiếp chỉ làm page bị chặn nặng/lâu hơn
                         if (errCode === 2022 || errCode === '2022' || errMsg.includes('#2022') || errMsg.includes('(2022)')) {
                             const reason = `⛔ Page đang bị Facebook chặn (#2022) — ngừng gửi cả page, thử lại sau vài giờ`;
-                            pageBlockedErr.set(pageId, reason);
+                            setPageBlock(pageId, reason);
                             results.push({ psid: recipient.psid, name: recipient.name, success: false, error: reason, via: 'pancake' });
                             continue;
                         }
@@ -2019,7 +2068,7 @@ export async function POST(req: NextRequest) {
                 }
 
                 // 2. Gửi hình ảnh
-                if (imageBuffers.length > 0 && pageImgBlocked2022.has(pageId)) {
+                if (imageBuffers.length > 0 && isPageImgBlocked(pageId)) {
                     // Page đã dính #2022 với ảnh trong đợt này → bỏ qua ảnh cho khách còn lại
                     imageSuccess = false;
                     console.warn(`[img] ⛔ Bỏ qua ảnh cho ${recipient.name} — page ${pageId} đang bị #2022`);
@@ -2065,7 +2114,7 @@ export async function POST(req: NextRequest) {
                                             }
                                             const sCode = sendImgData.error_code || sendImgData.code || sendImgData.e_code;
                                             console.warn(`[img] binary content_ids fail:`, JSON.stringify(sendImgData).slice(0, 150));
-                                            if (sCode === 2022) { imgBlocked = true; pageImgBlocked2022.add(pageId); console.warn(`[img] ⛔ Page bị FB chặn #2022 — ngừng gửi ảnh cho CẢ page này trong đợt`); break; }
+                                            if (sCode === 2022) { imgBlocked = true; blockPageImg(pageId); console.warn(`[img] ⛔ Page bị FB chặn #2022 — ngừng gửi ảnh cho CẢ page trong 30'`); break; }
                                             if (sCode === 105 && crmToken) {
                                                 const fresh = await generatePageAccessToken(pageId, crmToken, true);
                                                 if (fresh) { pageTokens.set(pageId, fresh); console.log(`[img] 🔄 Làm mới token page ${pageId}, thử lại`); continue; }
@@ -2073,7 +2122,7 @@ export async function POST(req: NextRequest) {
                                             if (imgAttempt < 2) { await new Promise(r => setTimeout(r, 700)); continue; }
                                         } else {
                                             console.warn(`[img] upload_contents không trả content_id:`, JSON.stringify(uploadData).slice(0, 120));
-                                            if (uCode === 2022) { imgBlocked = true; pageImgBlocked2022.add(pageId); break; }
+                                            if (uCode === 2022) { imgBlocked = true; blockPageImg(pageId); break; }
                                             if (uCode === 105 && crmToken) {
                                                 const fresh = await generatePageAccessToken(pageId, crmToken, true);
                                                 if (fresh) { pageTokens.set(pageId, fresh); console.log(`[img] 🔄 Làm mới token page ${pageId}, thử lại`); continue; }
@@ -2162,6 +2211,9 @@ export async function POST(req: NextRequest) {
                     error: err instanceof Error ? err.message : "Network error",
                 });
             }
+          }
+          } finally {
+            inFlightSends.delete(dedupKey);
           }
         };
 
