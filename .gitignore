@@ -17,3 +17,6 @@ uploads/
 # Kho chat kéo về (tên/sđt khách) + token — cấm commit
 khay-tu-khoa/data/chats/
 khay-tu-khoa/data/token-keo-chat.txt
+
+# Postgres nhúng cho máy dev
+tmp/

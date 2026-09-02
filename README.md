@@ -54,6 +54,29 @@ npm run check:db            # kết nối + bảng
 npm run check:tokens        # token còn sống không
 ```
 
+**Chưa có PostgreSQL trên máy?** `npm run db:dev` dựng một Postgres thật ngay trong
+`tmp/pgdata` (không cần cài Postgres hay Docker), in ra `DATABASE_URL` để dán vào `.env`.
+Dùng cho máy dev; trên VPS dùng Postgres cài đặt thật.
+
+## Kiểm tra
+
+```bash
+npm run test:smoke          # 115 kiểm tra tích hợp trên Postgres nhúng tạm
+```
+
+Bộ kiểm tra dựng DB sạch, chạy migration, rồi đi qua đúng luồng SYNC → PLAN → SEND →
+HEALTH → WEBHOOK bằng dữ liệu giả. Không cần token. Nó kiểm chứng những thứ khó nhìn bằng mắt:
+
+- `UNIQUE (customer_id, journey_day, slot_index)` — chạy PLAN hai lần không xếp trùng
+- `FOR UPDATE SKIP LOCKED` — ba worker song song không ai lấy trùng lượt của ai
+- Công thức xoay vòng ánh xạ đúng vào `script_messages`
+- Khách rơi khỏi cửa sổ 7 ngày rồi nhắn lại → vào chuỗi lại từ ngày 1
+- Khách đã chặn không bị sync hồi sinh
+- Page bị ngưng → `pickBatch` không lấy gì dù lượt đã tới hạn
+- Quy đổi giờ địa phương → UTC cho cả Riyadh (+3) lẫn Tokyo (+9)
+
+Phần **không** được phủ: gọi API Pancake/Facebook thật (cần token — dùng `npm run check:tokens`).
+
 ## Đưa một page vào chạy
 
 ```bash
@@ -106,6 +129,8 @@ npm run job:plan   -- --page <id> --dry-run  # xem sẽ xếp gì
 npm run job:send   -- --page <id>            # gửi ngay những lượt tới hạn của một page
 npm run job:send   -- --loop                 # chạy liên tục, 60s một lượt (khi không có cron)
 npm run job:health -- --page <id>
+npm run test:smoke                           # bộ kiểm tra tích hợp
+npm run db:dev                               # Postgres nhúng cho máy dev
 ```
 
 ## Webhook
@@ -152,6 +177,7 @@ src/clients/                 pancake.ts (quét + gửi chính) · facebook.ts (d
 src/db/                      pool · migrate · repositories/ (pages, customers, scripts, queue, health)
 src/jobs/                    sync · plan · send · health · webhook
 src/scripts/                 check-db · check-tokens · page:add · page:list · script:seed
+                             smoke-test.ts (115 kiểm tra) · dev-db.ts (Postgres nhúng)
 kich-ban/                    nội dung kịch bản (mau.json là khung)
 deploy/                      crontab + systemd mẫu
 ecosystem.config.cjs         pm2

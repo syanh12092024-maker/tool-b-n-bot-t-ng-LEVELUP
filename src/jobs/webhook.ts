@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { config } from "../config/index.js";
 import { jobLogger } from "../lib/logger.js";
 import { closePool } from "../db/pool.js";
+import { isMain } from "../lib/runner.js";
 import { matchOptOut } from "../domain/rules.js";
 import * as pagesRepo from "../db/repositories/pages.repo.js";
 import * as customersRepo from "../db/repositories/customers.repo.js";
@@ -40,7 +41,7 @@ function str(v: unknown): string {
 }
 
 /** Đọc payload — chấp nhận dạng phẳng của mình lẫn vài dạng lồng của Pancake. */
-function parseMessage(body: Record<string, unknown>): MessageEvent | null {
+export function parseMessage(body: Record<string, unknown>): MessageEvent | null {
     const pageId = str(body.page_id ?? (body.page as Record<string, unknown> | undefined)?.id);
     const psid = str(
         body.psid ??
@@ -53,7 +54,7 @@ function parseMessage(body: Record<string, unknown>): MessageEvent | null {
     return { pageId, psid, text };
 }
 
-function parseOrder(body: Record<string, unknown>): OrderEvent | null {
+export function parseOrder(body: Record<string, unknown>): OrderEvent | null {
     const pageId = str(body.page_id);
     const psid = str(body.psid ?? body.fb_id?.toString().split("_").slice(1).join("_"));
     if (!pageId || !psid) return null;
@@ -62,7 +63,7 @@ function parseOrder(body: Record<string, unknown>): OrderEvent | null {
 
 // ─── Xử lý sự kiện ────────────────────────────────────────────────────────────
 
-async function onMessage(ev: MessageEvent): Promise<string> {
+export async function onMessage(ev: MessageEvent): Promise<string> {
     const page = await pagesRepo.findByFbPageId(ev.pageId);
     if (!page) return "page không trong hệ thống";
     const cust = await customersRepo.findByPsid(page.id, ev.psid);
@@ -92,7 +93,7 @@ async function onMessage(ev: MessageEvent): Promise<string> {
     return "đã ghi nhận, chuỗi tiếp tục";
 }
 
-async function onOrder(ev: OrderEvent): Promise<string> {
+export async function onOrder(ev: OrderEvent): Promise<string> {
     const page = await pagesRepo.findByFbPageId(ev.pageId);
     if (!page) return "page không trong hệ thống";
     const cust = await customersRepo.findByPsid(page.id, ev.psid);
@@ -137,7 +138,8 @@ function send(res: ServerResponse, status: number, body: Record<string, unknown>
     res.end(JSON.stringify(body));
 }
 
-const server = createServer(async (req, res) => {
+export function createWebhookServer() {
+    return createServer(async (req, res) => {
     const url = req.url ?? "/";
 
     if (req.method === "GET" && url === "/health") {
@@ -172,17 +174,25 @@ const server = createServer(async (req, res) => {
         log.error({ url, err: msg }, "Xử lý webhook lỗi");
         return send(res, 500, { error: msg });
     }
-});
-
-server.listen(config.webhook.port, () => {
-    log.info({ port: config.webhook.port, secured: Boolean(config.webhook.secret), stopOnReply: config.journey.stopOnReply }, "Webhook đang nghe");
-    if (!config.webhook.secret) log.warn("WEBHOOK_SECRET trống — ai cũng gọi được. Đặt secret trước khi mở ra Internet.");
-});
-
-for (const sig of ["SIGINT", "SIGTERM"] as const) {
-    process.on(sig, () => {
-        log.info({ sig }, "Đang tắt webhook");
-        server.close(() => closePool().then(() => process.exit(0)));
-        setTimeout(() => process.exit(0), 5000).unref();
     });
+}
+
+// ─── Chạy độc lập ─────────────────────────────────────────────────────────────
+if (isMain(import.meta.url)) {
+    const server = createWebhookServer();
+    server.listen(config.webhook.port, () => {
+        log.info(
+            { port: config.webhook.port, secured: Boolean(config.webhook.secret), stopOnReply: config.journey.stopOnReply },
+            "Webhook đang nghe"
+        );
+        if (!config.webhook.secret) log.warn("WEBHOOK_SECRET trống — ai cũng gọi được. Đặt secret trước khi mở ra Internet.");
+    });
+
+    for (const sig of ["SIGINT", "SIGTERM"] as const) {
+        process.on(sig, () => {
+            log.info({ sig }, "Đang tắt webhook");
+            server.close(() => closePool().then(() => process.exit(0)));
+            setTimeout(() => process.exit(0), 5000).unref();
+        });
+    }
 }

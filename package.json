@@ -20,7 +20,9 @@
     "check:db": "tsx src/scripts/check-db.ts",
     "page:add": "tsx src/scripts/add-page.ts",
     "page:list": "tsx src/scripts/list-pages.ts",
-    "script:seed": "tsx src/scripts/seed-script.ts"
+    "script:seed": "tsx src/scripts/seed-script.ts",
+    "db:dev": "tsx src/scripts/dev-db.ts",
+    "test:smoke": "tsx src/scripts/smoke-test.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
@@ -31,6 +33,7 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
+    "embedded-postgres": "^18.4.0-beta.17",
     "pino-pretty": "^13.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
