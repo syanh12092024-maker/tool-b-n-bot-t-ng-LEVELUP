@@ -103,11 +103,25 @@ export function shouldStop(): boolean {
  * khoảng trắng sẽ bị mã hoá %XX trong import.meta.url và so chuỗi thô sẽ sai.
  */
 export function isMain(metaUrl: string): boolean {
-    const argv1 = process.argv[1];
-    if (!argv1) return false;
+    let self: string;
     try {
-        return fileURLToPath(metaUrl) === resolve(argv1);
+        self = fileURLToPath(metaUrl);
     } catch {
         return false;
     }
+
+    // pm2 fork mode KHÔNG chạy thẳng script của mình: nó nạp script qua wrapper
+    // ProcessContainerFork.js, nên process.argv[1] trỏ vào file của pm2 chứ không
+    // phải file này. Khi đó pm2 đặt đường dẫn thật vào biến pm_exec_path.
+    // Thiếu nhánh này thì mọi job đều thoát ngay khi chạy dưới pm2 và pm2 restart
+    // vô hạn — lỗi chỉ lộ ra khi deploy thật, chạy `node dist/...` trực tiếp vẫn đúng.
+    const candidates = [process.argv[1], process.env.pm_exec_path];
+    return candidates.some((c) => {
+        if (!c) return false;
+        try {
+            return resolve(c) === self;
+        } catch {
+            return false;
+        }
+    });
 }

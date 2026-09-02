@@ -578,6 +578,40 @@ try {
     await new Promise<void>((r) => web.close(() => r()));
     await query(`DELETE FROM pages WHERE page_id = 'SMOKE_WEB'`);
 
+    // ═══ 16. ĐIỂM VÀO JOB (isMain) ══════════════════════════════════════════
+    section("Điểm vào job — chạy đúng dưới pm2");
+    const runner = await import("../lib/runner.js");
+    const selfUrl = new URL("../lib/runner.js", import.meta.url).href;
+    const selfPath = (await import("node:url")).fileURLToPath(selfUrl);
+
+    const savedArgv1 = process.argv[1];
+    const savedPm2 = process.env.pm_exec_path;
+    try {
+        // Chạy thẳng: node dist/lib/runner.js
+        process.argv[1] = selfPath;
+        delete process.env.pm_exec_path;
+        eq("Chạy thẳng bằng node → là entrypoint", runner.isMain(selfUrl), true);
+
+        // ⭐ pm2 fork mode: argv[1] là wrapper của pm2, đường dẫn thật ở pm_exec_path.
+        // Thiếu nhánh này thì mọi job thoát ngay và pm2 restart vô hạn.
+        process.argv[1] = "/usr/lib/node_modules/pm2/lib/ProcessContainerFork.js";
+        process.env.pm_exec_path = selfPath;
+        eq("⭐ Dưới pm2 fork mode → vẫn nhận ra là entrypoint", runner.isMain(selfUrl), true);
+
+        // Bị import từ file khác thì KHÔNG được tự chạy
+        process.argv[1] = "/opt/banbot/dist/jobs/send.js";
+        process.env.pm_exec_path = "/opt/banbot/dist/jobs/send.js";
+        eq("Bị import từ job khác → không tự chạy", runner.isMain(selfUrl), false);
+
+        delete process.env.pm_exec_path;
+        process.argv[1] = "/opt/banbot/dist/jobs/send.js";
+        eq("Không có pm_exec_path và argv1 khác → không tự chạy", runner.isMain(selfUrl), false);
+    } finally {
+        if (savedArgv1 !== undefined) process.argv[1] = savedArgv1;
+        if (savedPm2 === undefined) delete process.env.pm_exec_path;
+        else process.env.pm_exec_path = savedPm2;
+    }
+
     await closePool();
 } catch (err) {
     failed++;
