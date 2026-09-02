@@ -1,0 +1,74 @@
+import { query, queryOne, withTransaction } from "../pool.js";
+import type { Script, ScriptMessage } from "../../domain/types.js";
+
+/** Kịch bản nuôi dưỡng và 12 nội dung của nó. */
+
+const SCRIPT_COLS = `id, page_id, name, journey_days, slots_per_day, message_count, is_active`;
+const MSG_COLS = `id, script_id, order_index, label, body, media`;
+
+export function activeScriptForPage(pageDbId: number): Promise<Script | null> {
+    return queryOne<Script>(`SELECT ${SCRIPT_COLS} FROM scripts WHERE page_id = $1 AND is_active`, [pageDbId]);
+}
+
+export function messagesForScript(scriptId: number): Promise<ScriptMessage[]> {
+    return query<ScriptMessage>(
+        `SELECT ${MSG_COLS} FROM script_messages WHERE script_id = $1 ORDER BY order_index`,
+        [scriptId]
+    );
+}
+
+export interface MessageInput {
+    label?: string | null;
+    body: string;
+    media?: string[];
+}
+
+/**
+ * Tạo hoặc thay kịch bản đang bật của page bằng bộ nội dung mới.
+ * Kịch bản cũ (nếu có) bị tắt chứ không xoá — send_log còn trỏ tới nội dung cũ.
+ */
+export async function replaceActiveScript(
+    pageDbId: number,
+    name: string,
+    messages: MessageInput[],
+    opts: { journeyDays: number; slotsPerDay: number }
+): Promise<{ script: Script; messageCount: number }> {
+    if (messages.length === 0) throw new Error("Kịch bản phải có ít nhất 1 nội dung");
+
+    return withTransaction(async (c) => {
+        await c.query(`UPDATE scripts SET is_active = FALSE WHERE page_id = $1 AND is_active`, [pageDbId]);
+
+        const created = await c.query<Script>(
+            `INSERT INTO scripts (page_id, name, journey_days, slots_per_day, message_count, is_active)
+             VALUES ($1, $2, $3, $4, $5, TRUE)
+             RETURNING ${SCRIPT_COLS}`,
+            [pageDbId, name, opts.journeyDays, opts.slotsPerDay, messages.length]
+        );
+        const script = created.rows[0];
+        if (!script) throw new Error("Không tạo được kịch bản");
+
+        for (let i = 0; i < messages.length; i++) {
+            const m = messages[i];
+            if (!m) continue;
+            await c.query(
+                `INSERT INTO script_messages (script_id, order_index, label, body, media)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [script.id, i, m.label ?? null, m.body, m.media ?? []]
+            );
+        }
+
+        return { script, messageCount: messages.length };
+    });
+}
+
+/** Sửa một nội dung tại chỗ — dùng cho dashboard sau này. */
+export async function updateMessage(id: number, patch: Partial<MessageInput>): Promise<void> {
+    await query(
+        `UPDATE script_messages
+            SET label = COALESCE($2, label),
+                body  = COALESCE($3, body),
+                media = COALESCE($4, media)
+          WHERE id = $1`,
+        [id, patch.label ?? null, patch.body ?? null, patch.media ?? null]
+    );
+}

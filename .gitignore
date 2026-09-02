@@ -1,0 +1,19 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Bí mật — KHÔNG BAO GIỜ commit
+.env
+.env.*
+!.env.example
+
+# Dữ liệu chạy
+logs/
+tmp/
+uploads/
+
+.DS_Store
+
+# Kho chat kéo về (tên/sđt khách) + token — cấm commit
+khay-tu-khoa/data/chats/
+khay-tu-khoa/data/token-keo-chat.txt

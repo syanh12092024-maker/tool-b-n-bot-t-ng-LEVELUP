@@ -1,0 +1,24 @@
+# PostgreSQL cho môi trường dev.
+# Trên VPS nên chạy Postgres cài trực tiếp hoặc dịch vụ managed thay vì compose này.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: banbot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: banbot
+      POSTGRES_PASSWORD: banbot
+      POSTGRES_DB: banbot
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - banbot-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U banbot -d banbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  banbot-pgdata:

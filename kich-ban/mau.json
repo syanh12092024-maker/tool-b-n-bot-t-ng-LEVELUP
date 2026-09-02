@@ -1,0 +1,16 @@
+[
+  { "label": "A1 · chào + giới thiệu", "body": "[THAY NỘI DUNG] Chào bạn 👋 Cảm ơn bạn đã quan tâm tới sản phẩm. Mình gửi bạn thông tin nhanh nhé…", "media": [] },
+  { "label": "A2 · báo giá",           "body": "[THAY NỘI DUNG] Giá hiện tại của sản phẩm là … — miễn phí giao hàng, nhận hàng mới thanh toán.", "media": ["https://example.com/anh-san-pham-1.jpg"] },
+  { "label": "A3 · công dụng",         "body": "[THAY NỘI DUNG] Sản phẩm giúp … Dùng đều trong 2 tuần sẽ thấy …", "media": [] },
+  { "label": "A4 · cách dùng",         "body": "[THAY NỘI DUNG] Cách dùng rất đơn giản: …", "media": [] },
+
+  { "label": "B1 · feedback khách",    "body": "[THAY NỘI DUNG] Đây là phản hồi của khách đã dùng sản phẩm tuần trước 👇", "media": ["https://example.com/feedback-1.jpg", "https://example.com/feedback-2.jpg"] },
+  { "label": "B2 · trước/sau",         "body": "[THAY NỘI DUNG] Ảnh trước và sau khi dùng 3 tuần của một khách ở …", "media": ["https://example.com/truoc-sau.jpg"] },
+  { "label": "B3 · cam kết",           "body": "[THAY NỘI DUNG] Mình cam kết: không hiệu quả hoàn tiền 100%, kiểm hàng trước khi trả tiền.", "media": [] },
+  { "label": "B4 · hỏi thăm",          "body": "[THAY NỘI DUNG] Bạn còn băn khoăn điều gì về sản phẩm không? Mình giải đáp ngay nhé 😊", "media": [] },
+
+  { "label": "C1 · ưu đãi có hạn",     "body": "[THAY NỘI DUNG] Hôm nay mình còn giữ được ưu đãi mua 2 tặng 1 cho bạn — chỉ đến hết tối nay.", "media": [] },
+  { "label": "C2 · khan hàng",         "body": "[THAY NỘI DUNG] Lô hàng này chỉ còn vài chục bộ, bạn muốn mình giữ 1 bộ cho bạn không?", "media": [] },
+  { "label": "C3 · hỏi thẳng",         "body": "[THAY NỘI DUNG] Mình lên đơn cho bạn nhé? Chỉ cần bạn gửi mình tên + số điện thoại + địa chỉ.", "media": [] },
+  { "label": "C4 · chốt cuối",         "body": "[THAY NỘI DUNG] Đây là tin cuối mình gửi về ưu đãi này. Nếu bạn cần, cứ nhắn mình bất cứ lúc nào 🙏", "media": [] }
+]

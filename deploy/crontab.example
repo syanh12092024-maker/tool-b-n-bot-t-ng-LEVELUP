@@ -1,0 +1,15 @@
+# Thay cho pm2 nếu muốn dùng crontab của hệ thống.
+#   crontab -e  → dán vào, sửa /opt/banbot thành thư mục thật
+# Log ghi vào logs/ (đã nằm trong .gitignore). Nhớ `npm run build` trước.
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+APP=/opt/banbot
+
+# Gửi — mỗi 5 phút
+*/5 * * * *        cd $APP && node dist/jobs/send.js   >> logs/send.log   2>&1
+# Đồng bộ tệp khách — mỗi giờ (job tự chọn page tới giờ 3h sáng địa phương)
+5 * * * *          cd $APP && node dist/jobs/sync.js   >> logs/sync.log   2>&1
+# Giám sát sức khoẻ — mỗi 15 phút
+2,17,32,47 * * * * cd $APP && node dist/jobs/health.js >> logs/health.log 2>&1
+# Webhook thì KHÔNG chạy bằng cron — dùng systemd hoặc pm2 vì nó phải chạy liên tục
