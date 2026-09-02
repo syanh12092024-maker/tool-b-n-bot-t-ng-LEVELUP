@@ -1,0 +1,19 @@
+# systemd unit cho dashboard (nếu không dùng pm2)
+#   sudo cp deploy/banbot-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now banbot-web
+[Unit]
+Description=Bắn bot TALPHA v2 — dashboard
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=banbot
+WorkingDirectory=/opt/banbot
+EnvironmentFile=/opt/banbot/.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node dist/web/server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

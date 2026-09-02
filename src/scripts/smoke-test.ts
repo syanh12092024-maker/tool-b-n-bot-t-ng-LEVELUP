@@ -501,6 +501,83 @@ try {
 
     await query(`DELETE FROM pages WHERE page_id = 'SMOKE_POS'`);
 
+    // ═══ 15. DASHBOARD ══════════════════════════════════════════════════════
+    section("Dashboard");
+    const htmlLib = await import("../web/html.js");
+
+    // XSS: tên khách lấy từ Facebook, không được tin
+    const evil = '<script>alert(1)</script>';
+    eq("esc chặn thẻ script", htmlLib.esc(evil), "&lt;script&gt;alert(1)&lt;/script&gt;");
+    eq("esc chặn ngoặc kép trong thuộc tính", htmlLib.esc('" onload="x'), "&quot; onload=&quot;x");
+    eq("esc xử lý null", htmlLib.esc(null), "");
+    eq("truncate cắt và thêm dấu …", htmlLib.truncate("abcdefghij", 5), "abcd…");
+    eq("truncate gộp khoảng trắng", htmlLib.truncate("a\n\nb   c", 20), "a b c");
+
+    // Dựng dữ liệu có thật để render
+    const dPage = await pagesRepo.upsert({ pageId: "SMOKE_WEB", pageName: "Page dashboard", market: "Test", utcOffset, pancakeShopId: "SHOP_9" });
+    await pagesRepo.setActive(dPage.id, true, 100);
+    const dScript = await scriptsRepo.replaceActiveScript(dPage.id, "KB dashboard", messages, { journeyDays: 7, slotsPerDay: 4 });
+    // Khách có tên độc hại — phải bị escape khi hiện ra
+    await customersRepo.upsertBatch(dPage.id, [
+        { ...mk("W_EVIL", 1), name: evil },
+        mk("W_OK", 2),
+    ]);
+    await planPage((await pagesRepo.findById(dPage.id))!, log);
+
+    // Một khách nhận tin rồi chốt đơn → có dữ liệu cho báo cáo quy công
+    const evilCust = (await customersRepo.findByPsid(dPage.id, "W_EVIL"))!;
+    const dMsgs = await scriptsRepo.messagesForScript(dScript.script.id);
+    await query(
+        `INSERT INTO send_log (customer_id, page_id, script_message_id, journey_day, slot_index, channel, success, sent_at)
+         VALUES ($1, $2, $3, 1, 0, 'pancake', TRUE, now() - interval '2 hours')`,
+        [evilCust.id, dPage.id, dMsgs[2]!.id]
+    );
+    await customersRepo.stop(evilCust.id, "converted", "Chốt đơn thử");
+    await customersRepo.recordEvent(evilCust.id, dPage.id, "ordered", 1, { orderId: "DH-WEB" });
+
+    const { createDashboardServer } = await import("../web/server.js");
+    const web = createDashboardServer();
+    const webPort = 19000 + Math.floor(Math.random() * 900);
+    await new Promise<void>((r) => web.listen(webPort, () => r()));
+    const wb = `http://127.0.0.1:${webPort}`;
+    const get = async (p: string) => {
+        const r = await fetch(wb + p);
+        return { status: r.status, body: await r.text() };
+    };
+
+    const homeRes = await get("/");
+    eq("GET / trả 200", homeRes.status, 200);
+    check("Trang chủ có tên page", homeRes.body.includes("Page dashboard"));
+    check("Trang chủ là HTML hoàn chỉnh", homeRes.body.startsWith("<!doctype html>") && homeRes.body.includes("</html>"));
+
+    const pageRes = await get(`/page/${dPage.id}`);
+    eq("GET /page/:id trả 200", pageRes.status, 200);
+    check("⭐ Tên khách độc hại bị escape, KHÔNG chèn được script", !pageRes.body.includes("<script>alert(1)</script>"));
+    check("…và vẫn hiện ra dạng văn bản", pageRes.body.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
+
+    eq("GET /page/:id/script trả 200", (await get(`/page/${dPage.id}/script`)).status, 200);
+    check("Trang kịch bản có bảng xoay vòng", (await get(`/page/${dPage.id}/script`)).body.includes("Lịch một khách sẽ nhận"));
+
+    const repRes = await get(`/report?page=${dPage.id}`);
+    eq("GET /report trả 200", repRes.status, 200);
+    check("Báo cáo quy công cho tin #3 (tin cuối trước khi chốt)", repRes.body.includes("Tin nào ra đơn nhiều nhất"));
+    const perf = await (await import("../db/repositories/report.repo.js")).messagePerformance(dPage.id);
+    eq("⭐ Quy công đúng vào tin cuối nhận trước lúc chốt", perf.find((m) => m.order_index === 2)?.conversions, 1);
+    eq("…các tin khác không được tính công", perf.filter((m) => m.conversions > 0).length, 1);
+
+    eq("GET /customer/:id trả 200", (await get(`/customer/${evilCust.id}`)).status, 200);
+    eq("GET /search có kết quả", (await get("/search?q=W_OK")).status, 200);
+    check("Tìm theo PSID ra đúng khách", (await get("/search?q=W_OK")).body.includes("W_OK"));
+    eq("GET /jobs trả 200", (await get("/jobs")).status, 200);
+    eq("GET /healthz trả 200", (await get("/healthz")).status, 200);
+    eq("Trang không tồn tại → 404", (await get("/khong-co-trang-nay")).status, 404);
+    eq("Page id không tồn tại → 404", (await get("/page/999999")).status, 404);
+    eq("Khách id không tồn tại → 404", (await get("/customer/999999")).status, 404);
+    eq("POST bị từ chối (dashboard chỉ đọc)", (await fetch(wb + "/", { method: "POST" })).status, 405);
+
+    await new Promise<void>((r) => web.close(() => r()));
+    await query(`DELETE FROM pages WHERE page_id = 'SMOKE_WEB'`);
+
     await closePool();
 } catch (err) {
     failed++;

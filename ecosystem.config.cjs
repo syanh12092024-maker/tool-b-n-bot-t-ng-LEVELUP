@@ -23,6 +23,16 @@ module.exports = {
             env: { NODE_ENV: "production" },
         },
         {
+            // Dashboard chỉ đọc: chạy liên tục
+            name: "banbot-web",
+            script: "dist/web/server.js",
+            cwd,
+            autorestart: true,
+            max_restarts: 50,
+            restart_delay: 3000,
+            env: { NODE_ENV: "production" },
+        },
+        {
             // Gửi: mỗi 5 phút một lượt, mỗi lượt tự giới hạn 4,5 phút
             name: "banbot-send",
             script: "dist/jobs/send.js",

@@ -33,6 +33,9 @@ Bản thiết kế đầy đủ: xem artifact *Bắn bot TALPHA v2* (8 quyết �
   Pancake POS ▶ ┌───────────┐  số đơn tăng → converted, huỷ lượt còn chờ
                 │  5 · POS  │  (không cần ai gắn tag hay nối hệ thống ngoài)
                 └───────────┘
+                ┌───────────┐  đọc mọi bảng trên, KHÔNG ghi gì
+   người xem ◀─ │ DASHBOARD │  tổng quan · hiệu quả tin · tra cứu khách
+                └───────────┘
 ```
 
 Bốn tiến trình **không gọi nhau** — chỉ đọc/ghi PostgreSQL. Ràng buộc quan trọng nhất:
@@ -64,11 +67,11 @@ Dùng cho máy dev; trên VPS dùng Postgres cài đặt thật.
 ## Kiểm tra
 
 ```bash
-npm run test:smoke          # 141 kiểm tra tích hợp trên Postgres nhúng tạm
+npm run test:smoke          # 167 kiểm tra tích hợp trên Postgres nhúng tạm
 ```
 
 Bộ kiểm tra dựng DB sạch, chạy migration, rồi đi qua đúng luồng SYNC → PLAN → SEND →
-POS → HEALTH → WEBHOOK bằng dữ liệu giả. Không cần token. Nó kiểm chứng những thứ khó nhìn bằng mắt:
+POS → HEALTH → WEBHOOK → DASHBOARD bằng dữ liệu giả. Không cần token. Nó kiểm chứng những thứ khó nhìn bằng mắt:
 
 - `UNIQUE (customer_id, journey_day, slot_index)` — chạy PLAN hai lần không xếp trùng
 - `FOR UPDATE SKIP LOCKED` — ba worker song song không ai lấy trùng lượt của ai
@@ -78,6 +81,8 @@ POS → HEALTH → WEBHOOK bằng dữ liệu giả. Không cần token. Nó ki�
 - Page bị ngưng → `pickBatch` không lấy gì dù lượt đã tới hạn
 - Quy đổi giờ địa phương → UTC cho cả Riyadh (+3) lẫn Tokyo (+9)
 - Mốc chuẩn POS: khách mua từ trước vẫn được nuôi dưỡng, mua thêm thì mới dừng
+- Dashboard escape tên khách lấy từ Facebook (không chèn được thẻ script)
+- Báo cáo quy công đúng vào tin cuối khách nhận trước lúc chốt
 
 Phần **không** được phủ: gọi API Pancake/Facebook thật (cần token — dùng `npm run check:tokens`).
 
@@ -124,6 +129,7 @@ Không dùng pm2? Xem `deploy/crontab.example` + `deploy/banbot-webhook.service`
 | pos     | mỗi 15 phút   | đối chiếu đơn từ Pancake POS → dừng chuỗi cho khách vừa chốt   |
 | health  | mỗi 15 phút   | đọc `send_log` 60 phút → pause / degrade / recover từng page   |
 | webhook | liên tục      | `POST /webhook/message` · `POST /webhook/order` · `GET /health` |
+| web     | liên tục      | dashboard chỉ đọc ở cổng 8090                                  |
 
 ## Lệnh hay dùng
 
@@ -137,7 +143,49 @@ npm run job:pos    -- --page <id> --dry-run  # xem POS có bao nhiêu khách c�
 npm run job:health -- --page <id>
 npm run test:smoke                           # bộ kiểm tra tích hợp
 npm run db:dev                               # Postgres nhúng cho máy dev
+npm run web                                  # dashboard
+npm run seed:demo                            # dữ liệu mẫu để xem dashboard
 ```
+
+## Dashboard
+
+```bash
+npm run web        # → http://localhost:8090
+```
+
+Chỉ đọc — **không có nút nào ghi dữ liệu**. Mọi thay đổi (thêm page, nạp kịch bản, bật/tắt) đều
+qua CLI. Nhờ vậy dashboard không thể làm hỏng chiến dịch đang chạy và không cần lo CSRF.
+
+| Trang | Trả lời câu hỏi |
+|---|---|
+| `/` Tổng quan | Page nào đang chạy, bao nhiêu khách đang nuôi, hôm nay gửi được bao nhiêu, page nào đang bị ngưng |
+| `/page/:id` | Khách phân bố ở ngày nào, hàng đợi ra sao, lỗi gì trong 24h, sức khoẻ page theo từng 15 phút |
+| `/page/:id/script` | 12 nội dung + bảng lịch: khách nhận tin số mấy vào ngày nào |
+| `/report` | **Tin nào ra đơn nhiều nhất** · khách thường chốt ở ngày thứ mấy |
+| `/customer/:id` | Một khách đã nhận gì, lúc nào, qua kênh nào, sắp nhận gì |
+| `/search?q=` | Tra theo tên · số điện thoại · PSID |
+
+Bảo vệ bằng HTTP Basic: đặt `DASHBOARD_PASSWORD` trong `.env` (bỏ trống = mở, chỉ nên dùng khi
+chạy local). Trang tự đổi sáng/tối theo hệ điều hành, không gọi CDN nào — chạy được cả khi VPS
+bị chặn ra ngoài.
+
+### Cách tính "tin nào ra đơn nhiều nhất"
+
+Quy công theo **chạm cuối**: mỗi khách đã chốt được tính cho tin **cuối cùng** họ nhận thành công
+trước thời điểm chốt. Không hoàn hảo — khách có thể đã quyết định từ tin trước đó — nhưng nhất
+quán và đủ để so sánh các tin với nhau. Nếu tin #9 (ưu đãi có hạn) ra đơn gấp ba tin #3, đó là
+tín hiệu thật để anh/chị viết lại tin #3.
+
+### Xem thử trước khi có dữ liệu thật
+
+```bash
+npm run db:dev      # cửa sổ 1: Postgres nhúng
+npm run seed:demo   # cửa sổ 2: dựng 4 page mẫu ~900 khách, nhật ký gửi, đơn hàng
+npm run web         # → http://localhost:8090
+```
+
+`seed:demo` **xoá sạch** mọi page có tiền tố `DEMO_` rồi tạo lại; không đụng page thật. Chỉ chạy
+trên database dev.
 
 ## Bắt đơn tự động (POS)
 
@@ -214,10 +262,11 @@ migrations/                  001_init.sql (schema gốc) · 002_pos.sql (mốc c
 src/config/                  env (zod) · bảng múi giờ thị trường
 src/domain/                  journey.ts (công thức xoay vòng) · rules.ts (tag mua hàng, từ khoá từ chối) · types.ts
 src/clients/                 pancake.ts (quét + gửi chính) · facebook.ts (dự phòng, thang 4 tag) · pos.ts (đơn hàng)
-src/db/                      pool · migrate · repositories/ (pages, customers, scripts, queue, health)
+src/db/                      pool · migrate · repositories/ (pages, customers, scripts, queue, health, report)
 src/jobs/                    sync · plan · send · pos · health · webhook
+src/web/                     server.ts (định tuyến) · views.ts (các trang) · html.ts (CSS + escape)
 src/scripts/                 check-db · check-tokens · page:add · page:list · script:seed
-                             smoke-test.ts (141 kiểm tra) · dev-db.ts (Postgres nhúng)
+                             smoke-test.ts (167 kiểm tra) · dev-db.ts · seed-demo.ts
 config/                      pos-shops.json (gitignore, chép từ .example) — khoá POS từng shop
 kich-ban/                    nội dung kịch bản (mau.json là khung)
 deploy/                      crontab + systemd mẫu
@@ -235,3 +284,4 @@ ecosystem.config.cjs         pm2
 | Biết ai đã chốt | không | POS + webhook + tag → dừng chuỗi |
 | Sức khoẻ page | cầu dao 30' | đo mỗi 15', hãm tốc trước khi bị chặn, leo thang |
 | Nơi chạy | Mac cá nhân | VPS 24/7 |
+| Đo hiệu quả | không có | dashboard: tin nào ra đơn, chốt ở ngày mấy |
