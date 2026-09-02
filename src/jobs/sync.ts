@@ -78,6 +78,10 @@ export async function syncPage(page: Page, log: Logger, opts: { dryRun?: boolean
         stats.updated += r.updated;
         await customersRepo.recordEvents(page.id, r.insertedIds, "entered");
         await customersRepo.recordEvents(page.id, r.rejoinedIds, "restarted");
+        // Khách quay lại mang theo mốc chuẩn POS của chuỗi TRƯỚC — xoá đi để lần
+        // đối chiếu POS kế tiếp ghi lại theo số đơn hiện tại, nếu không họ sẽ
+        // không bao giờ được tính là "vừa chốt" trong chuỗi mới này.
+        await customersRepo.resetPosBaseline(r.rejoinedIds);
     }
 
     // 3. Danh sách chặn luôn thắng

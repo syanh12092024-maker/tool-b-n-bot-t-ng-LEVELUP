@@ -30,6 +30,9 @@ Bản thiết kế đầy đủ: xem artifact *Bắn bot TALPHA v2* (8 quyết �
   khách nhắn ─▶ ┌───────────┐  opt-out · chốt đơn → dừng chuỗi, huỷ hàng đợi
   đơn hàng ───▶ │  WEBHOOK  │
                 └───────────┘
+  Pancake POS ▶ ┌───────────┐  số đơn tăng → converted, huỷ lượt còn chờ
+                │  5 · POS  │  (không cần ai gắn tag hay nối hệ thống ngoài)
+                └───────────┘
 ```
 
 Bốn tiến trình **không gọi nhau** — chỉ đọc/ghi PostgreSQL. Ràng buộc quan trọng nhất:
@@ -61,11 +64,11 @@ Dùng cho máy dev; trên VPS dùng Postgres cài đặt thật.
 ## Kiểm tra
 
 ```bash
-npm run test:smoke          # 115 kiểm tra tích hợp trên Postgres nhúng tạm
+npm run test:smoke          # 141 kiểm tra tích hợp trên Postgres nhúng tạm
 ```
 
 Bộ kiểm tra dựng DB sạch, chạy migration, rồi đi qua đúng luồng SYNC → PLAN → SEND →
-HEALTH → WEBHOOK bằng dữ liệu giả. Không cần token. Nó kiểm chứng những thứ khó nhìn bằng mắt:
+POS → HEALTH → WEBHOOK bằng dữ liệu giả. Không cần token. Nó kiểm chứng những thứ khó nhìn bằng mắt:
 
 - `UNIQUE (customer_id, journey_day, slot_index)` — chạy PLAN hai lần không xếp trùng
 - `FOR UPDATE SKIP LOCKED` — ba worker song song không ai lấy trùng lượt của ai
@@ -74,6 +77,7 @@ HEALTH → WEBHOOK bằng dữ liệu giả. Không cần token. Nó kiểm ch�
 - Khách đã chặn không bị sync hồi sinh
 - Page bị ngưng → `pickBatch` không lấy gì dù lượt đã tới hạn
 - Quy đổi giờ địa phương → UTC cho cả Riyadh (+3) lẫn Tokyo (+9)
+- Mốc chuẩn POS: khách mua từ trước vẫn được nuôi dưỡng, mua thêm thì mới dừng
 
 Phần **không** được phủ: gọi API Pancake/Facebook thật (cần token — dùng `npm run check:tokens`).
 
@@ -117,6 +121,7 @@ Không dùng pm2? Xem `deploy/crontab.example` + `deploy/banbot-webhook.service`
 |---------|---------------|---------------------------------------------------------------|
 | sync    | mỗi giờ       | tự chọn page đang ở `SYNC_HOUR_LOCAL` (3h) giờ địa phương → quét Pancake → gọi plan |
 | send    | mỗi 5 phút    | lấy lượt tới hạn, gửi theo lô, ngân sách 4,5 phút/lượt        |
+| pos     | mỗi 15 phút   | đối chiếu đơn từ Pancake POS → dừng chuỗi cho khách vừa chốt   |
 | health  | mỗi 15 phút   | đọc `send_log` 60 phút → pause / degrade / recover từng page   |
 | webhook | liên tục      | `POST /webhook/message` · `POST /webhook/order` · `GET /health` |
 
@@ -128,10 +133,45 @@ npm run job:sync   -- --force                # đồng bộ mọi page đang b�
 npm run job:plan   -- --page <id> --dry-run  # xem sẽ xếp gì
 npm run job:send   -- --page <id>            # gửi ngay những lượt tới hạn của một page
 npm run job:send   -- --loop                 # chạy liên tục, 60s một lượt (khi không có cron)
+npm run job:pos    -- --page <id> --dry-run  # xem POS có bao nhiêu khách của page
 npm run job:health -- --page <id>
 npm run test:smoke                           # bộ kiểm tra tích hợp
 npm run db:dev                               # Postgres nhúng cho máy dev
 ```
+
+## Bắt đơn tự động (POS)
+
+Hệ thống nhận biết khách đã chốt qua **ba** đường, đường nào tới trước thì dừng chuỗi:
+
+| Đường | Cần gì | Ghi chú |
+|---|---|---|
+| Tag mua hàng | nhân viên gắn tag lên hội thoại | chạy trong job `sync`, danh sách tag ở `src/domain/rules.ts` |
+| Webhook đơn | ai đó nối hệ thống ngoài gọi `/webhook/order` | tức thì |
+| **POS** | `config/pos-shops.json` | tự động, không cần ai đổi thói quen |
+
+```bash
+cp config/pos-shops.example.json config/pos-shops.json   # điền shop_id + api_key thật
+npm run check:tokens                                     # kiểm khoá từng shop
+npm run job:pos -- --dry-run                             # xem POS có bao nhiêu khách
+```
+
+Rồi gắn shop vào page: `npm run page:add -- --page <id> --market Saudi --shop <shop_id>`.
+Page không gắn shop thì job POS bỏ qua. Nhiều page dùng chung một shop chỉ gọi POS **một lần** mỗi lượt.
+
+### Vì sao có "mốc chuẩn"
+
+POS đếm đơn **trọn đời**, nên "có đơn" không đồng nghĩa "vừa chốt trong chuỗi này". Người mua
+6 tháng trước mà nay nhắn lại là khách ấm, đáng nuôi dưỡng tiếp. Vì vậy lần đối chiếu đầu tiên
+chỉ **ghi mốc** bằng đúng số đơn hiện có, và chỉ dừng chuỗi khi số đơn **vượt** mốc đó.
+
+```
+P2 vào chuỗi, POS báo 3 đơn  →  ghi mốc = 3, vẫn nuôi dưỡng
+POS báo 3 đơn (lượt sau)     →  không đổi
+POS báo 4 đơn                →  vượt mốc → converted, huỷ lượt còn chờ
+P2 rơi khỏi cửa sổ rồi quay lại → xoá mốc, lần đối chiếu sau ghi mốc mới = 4
+```
+
+Muốn dừng **mọi** người từng có đơn thì đặt `POS_CONVERT_MODE=any` trong `.env`.
 
 ## Webhook
 
@@ -170,14 +210,15 @@ UPDATE pages SET is_active = FALSE WHERE page_id = '123456789';
 ## Cấu trúc
 
 ```
-migrations/001_init.sql      schema — mọi ràng buộc quan trọng nằm ở đây
+migrations/                  001_init.sql (schema gốc) · 002_pos.sql (mốc chuẩn POS)
 src/config/                  env (zod) · bảng múi giờ thị trường
 src/domain/                  journey.ts (công thức xoay vòng) · rules.ts (tag mua hàng, từ khoá từ chối) · types.ts
-src/clients/                 pancake.ts (quét + gửi chính) · facebook.ts (dự phòng, thang 4 tag)
+src/clients/                 pancake.ts (quét + gửi chính) · facebook.ts (dự phòng, thang 4 tag) · pos.ts (đơn hàng)
 src/db/                      pool · migrate · repositories/ (pages, customers, scripts, queue, health)
-src/jobs/                    sync · plan · send · health · webhook
+src/jobs/                    sync · plan · send · pos · health · webhook
 src/scripts/                 check-db · check-tokens · page:add · page:list · script:seed
-                             smoke-test.ts (115 kiểm tra) · dev-db.ts (Postgres nhúng)
+                             smoke-test.ts (141 kiểm tra) · dev-db.ts (Postgres nhúng)
+config/                      pos-shops.json (gitignore, chép từ .example) — khoá POS từng shop
 kich-ban/                    nội dung kịch bản (mau.json là khung)
 deploy/                      crontab + systemd mẫu
 ecosystem.config.cjs         pm2
@@ -191,6 +232,6 @@ ecosystem.config.cjs         pm2
 | Nội dung | cả tệp nhận cùng một tin | mỗi khách theo ngày thứ N của riêng mình |
 | Chống trùng | RAM — 2 tiến trình là hỏng | `UNIQUE` ở database |
 | Nhật ký | tổng số/đoạn | `send_log` từng tin |
-| Biết ai đã chốt | không | webhook + tag → dừng chuỗi |
+| Biết ai đã chốt | không | POS + webhook + tag → dừng chuỗi |
 | Sức khoẻ page | cầu dao 30' | đo mỗi 15', hãm tốc trước khi bị chặn, leo thang |
 | Nơi chạy | Mac cá nhân | VPS 24/7 |

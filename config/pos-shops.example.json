@@ -1,0 +1,10 @@
+[
+  { "name": "Saudi",   "shop_id": "<SHOP_ID>", "api_key": "<POS_API_KEY>" },
+  { "name": "UAE",     "shop_id": "<SHOP_ID>", "api_key": "<POS_API_KEY>" },
+  { "name": "Kuwait",  "shop_id": "<SHOP_ID>", "api_key": "<POS_API_KEY>" },
+  { "name": "Oman",    "shop_id": "<SHOP_ID>", "api_key": "<POS_API_KEY>" },
+  { "name": "Qatar",   "shop_id": "<SHOP_ID>", "api_key": "<POS_API_KEY>" },
+  { "name": "Bahrain", "shop_id": "<SHOP_ID>", "api_key": "<POS_API_KEY>" },
+  { "name": "Japan",   "shop_id": "<SHOP_ID>", "api_key": "<POS_API_KEY>" },
+  { "name": "Taiwan",  "shop_id": "<SHOP_ID>", "api_key": "<POS_API_KEY>" }
+]

@@ -11,7 +11,7 @@ import type { Customer, SyncedCustomer, CustomerEventType } from "../../domain/t
 const COLS = `
     id, page_id, psid, conversation_id, name, phone, order_count, tags,
     first_seen_at, last_interaction_at, journey_day, journey_count,
-    status, stop_reason, stopped_at
+    status, stop_reason, stopped_at, order_count_baseline, pos_checked_at
 `;
 
 export interface UpsertStats {
@@ -290,5 +290,106 @@ export async function touchInteraction(id: number, at: Date = new Date()): Promi
     await query(
         `UPDATE customers SET last_interaction_at = GREATEST(last_interaction_at, $2) WHERE id = $1`,
         [id, at.toISOString()]
+    );
+}
+
+// ─── Đối chiếu POS ────────────────────────────────────────────────────────────
+
+export interface PosMatch {
+    psid: string;
+    orderCount: number;
+}
+
+export interface PosSyncStats {
+    matched: number;
+    baselineSet: number;
+    converted: number;
+    convertedIds: number[];
+}
+
+/**
+ * Đối chiếu số đơn từ POS vào tệp khách của một page.
+ *
+ * POS đếm đơn TRỌN ĐỜI, nên "có đơn" không đồng nghĩa "vừa chốt trong chuỗi này":
+ * người mua 6 tháng trước mà nay nhắn lại là khách ấm, đáng nuôi dưỡng tiếp.
+ *
+ *   mode 'increase' (mặc định) — lần đầu gặp khách thì ghi mốc chuẩn, chỉ dừng
+ *                                khi số đơn VƯỢT mốc đó (tức vừa chốt thật)
+ *   mode 'any'                 — dừng với bất kỳ ai đã từng có đơn
+ */
+export async function applyPosOrders(
+    pageDbId: number,
+    matches: PosMatch[],
+    mode: "increase" | "any" = "increase"
+): Promise<PosSyncStats> {
+    const stats: PosSyncStats = { matched: 0, baselineSet: 0, converted: 0, convertedIds: [] };
+    if (matches.length === 0) return stats;
+
+    const rows = await query<{ id: number; action: string }>(
+        `WITH incoming AS (
+             SELECT * FROM unnest($2::text[], $3::int[]) AS t(psid, order_count)
+         ),
+         joined AS (
+             SELECT c.id,
+                    c.order_count_baseline AS baseline,
+                    i.order_count          AS pos_count
+               FROM customers c
+               JOIN incoming  i ON i.psid = c.psid
+              WHERE c.page_id = $1 AND c.status = 'active'
+         ),
+         updated AS (
+             UPDATE customers c
+                SET order_count          = j.pos_count,
+                    pos_checked_at       = now(),
+                    -- Lần đầu gặp: ghi mốc chuẩn bằng đúng số đơn hiện có
+                    order_count_baseline = COALESCE(c.order_count_baseline, j.pos_count),
+                    status = CASE
+                        WHEN ($4 = 'any'      AND j.pos_count > 0) THEN 'converted'::customer_status
+                        WHEN ($4 = 'increase' AND j.baseline IS NOT NULL AND j.pos_count > j.baseline)
+                             THEN 'converted'::customer_status
+                        ELSE c.status END,
+                    stop_reason = CASE
+                        WHEN ($4 = 'any'      AND j.pos_count > 0)
+                             THEN 'Đã có đơn trên POS (' || j.pos_count || ')'
+                        WHEN ($4 = 'increase' AND j.baseline IS NOT NULL AND j.pos_count > j.baseline)
+                             THEN 'Chốt đơn mới trên POS (' || j.baseline || ' → ' || j.pos_count || ')'
+                        ELSE c.stop_reason END,
+                    stopped_at = CASE
+                        WHEN ($4 = 'any'      AND j.pos_count > 0) THEN now()
+                        WHEN ($4 = 'increase' AND j.baseline IS NOT NULL AND j.pos_count > j.baseline) THEN now()
+                        ELSE c.stopped_at END
+               FROM joined j
+              WHERE c.id = j.id
+              RETURNING c.id,
+                        CASE
+                            WHEN c.status = 'converted' THEN 'converted'
+                            WHEN j.baseline IS NULL     THEN 'baseline'
+                            ELSE 'matched' END AS action
+         )
+         SELECT id, action FROM updated`,
+        [pageDbId, matches.map((m) => m.psid), matches.map((m) => m.orderCount), mode]
+    );
+
+    for (const r of rows) {
+        stats.matched++;
+        if (r.action === "converted") {
+            stats.converted++;
+            stats.convertedIds.push(r.id);
+        } else if (r.action === "baseline") {
+            stats.baselineSet++;
+        }
+    }
+    return stats;
+}
+
+/**
+ * Khách vào chuỗi mới (mới hoặc quay lại) cần mốc chuẩn mới: xoá mốc cũ để lần
+ * đối chiếu POS kế tiếp ghi lại theo số đơn hiện tại.
+ */
+export async function resetPosBaseline(ids: number[]): Promise<void> {
+    if (ids.length === 0) return;
+    await query(
+        `UPDATE customers SET order_count_baseline = NULL, pos_checked_at = NULL WHERE id = ANY($1::bigint[])`,
+        [ids]
     );
 }

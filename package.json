@@ -22,7 +22,8 @@
     "page:list": "tsx src/scripts/list-pages.ts",
     "script:seed": "tsx src/scripts/seed-script.ts",
     "db:dev": "tsx src/scripts/dev-db.ts",
-    "test:smoke": "tsx src/scripts/smoke-test.ts"
+    "test:smoke": "tsx src/scripts/smoke-test.ts",
+    "job:pos": "tsx src/jobs/pos.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

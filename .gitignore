@@ -20,3 +20,6 @@ khay-tu-khoa/data/token-keo-chat.txt
 
 # Postgres nhúng cho máy dev
 tmp/
+
+# Khoá POS thật — KHÔNG commit
+config/pos-shops.json

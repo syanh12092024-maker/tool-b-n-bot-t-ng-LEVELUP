@@ -87,7 +87,7 @@ try {
     // ═══ 1. MIGRATION ═══════════════════════════════════════════════════════
     section("Migration");
     const applied = await migrate();
-    eq("Áp dụng đúng 1 file migration", applied, 1);
+    eq("Áp dụng đúng 2 file migration", applied, 2);
     const tables = await query<{ n: number }>(
         `SELECT COUNT(*)::int AS n FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
     );
@@ -419,6 +419,87 @@ try {
     eq("isWithinSendWindow: 8 ngày ngoài cửa sổ", time.isWithinSendWindow(new Date(now.getTime() - 8 * DAY), 7, now), false);
 
     await query(`DELETE FROM pages WHERE page_id = 'SMOKE_WEBHOOK'`);
+
+    // ═══ 14. POS — đối chiếu đơn hàng ═══════════════════════════════════════
+    section("POS — đối chiếu đơn hàng");
+    const posClient = await import("../clients/pos.js");
+
+    eq("splitFbId cắt ở gạch dưới ĐẦU TIÊN", posClient.splitFbId("123456_9876_54"), { pageId: "123456", psid: "9876_54" });
+    eq("splitFbId từ chối chuỗi không có gạch", posClient.splitFbId("123456"), null);
+    eq("splitFbId từ chối gạch ở đầu", posClient.splitFbId("_9876"), null);
+    eq("splitFbId từ chối gạch ở cuối", posClient.splitFbId("123456_"), null);
+
+    // Dựng page + khách để đối chiếu
+    const pPage = await pagesRepo.upsert({ pageId: "SMOKE_POS", pageName: "Page POS", market: "Test", utcOffset, pancakeShopId: "SHOP_1" });
+    await pagesRepo.setActive(pPage.id, true, 100);
+    await scriptsRepo.replaceActiveScript(pPage.id, "KB POS", messages, { journeyDays: 7, slotsPerDay: 4 });
+    await customersRepo.upsertBatch(pPage.id, [mk("P1", 1), mk("P2", 1), mk("P3", 1)]);
+    await planPage((await pagesRepo.findById(pPage.id))!, log);
+
+    const pid = async (psid: string) => (await customersRepo.findByPsid(pPage.id, psid))!;
+    const queuedFor = async (id: number) =>
+        (await queryOne<{ n: number }>(`SELECT COUNT(*)::int AS n FROM send_queue WHERE customer_id = $1 AND state = 'queued'`, [id]))?.n ?? 0;
+
+    // Lượt 1: P1 chưa đơn, P2 đã có 3 đơn từ trước, P3 chưa đơn
+    const r1 = await customersRepo.applyPosOrders(pPage.id, [
+        { psid: "P1", orderCount: 0 }, { psid: "P2", orderCount: 3 }, { psid: "P3", orderCount: 0 },
+    ], "increase");
+    eq("Lượt đầu: ghi mốc chuẩn cho cả 3, chưa ai converted", [r1.matched, r1.baselineSet, r1.converted], [3, 3, 0]);
+    eq("⭐ Khách đã mua TỪ TRƯỚC vẫn được nuôi dưỡng tiếp (mode increase)", (await pid("P2")).status, "active");
+    eq("…mốc chuẩn của P2 = 3 đơn sẵn có", (await pid("P2")).order_count_baseline, 3);
+
+    // Lượt 2: P1 vừa chốt 1 đơn, P2 giữ nguyên 3, P3 vẫn 0
+    const p1Queued = await queuedFor((await pid("P1")).id);
+    check("P1 còn lượt chờ trước khi chốt", p1Queued > 0);
+    const r2 = await customersRepo.applyPosOrders(pPage.id, [
+        { psid: "P1", orderCount: 1 }, { psid: "P2", orderCount: 3 }, { psid: "P3", orderCount: 0 },
+    ], "increase");
+    eq("Lượt 2: chỉ P1 converted", [r2.converted, r2.baselineSet], [1, 0]);
+    eq("…P1 thành converted", (await pid("P1")).status, "converted");
+    eq("…lý do ghi rõ 0 → 1", (await pid("P1")).stop_reason, "Chốt đơn mới trên POS (0 → 1)");
+    eq("…P2 mua từ trước vẫn active", (await pid("P2")).status, "active");
+    eq("…P3 chưa đơn vẫn active", (await pid("P3")).status, "active");
+    eq("Huỷ lượt chờ của P1", await queueRepo.cancelPendingForCustomer((await pid("P1")).id, "POS"), p1Queued);
+
+    // P2 mua thêm đơn thứ 4 → giờ mới converted
+    const r3 = await customersRepo.applyPosOrders(pPage.id, [{ psid: "P2", orderCount: 4 }], "increase");
+    eq("P2 mua thêm đơn → converted", r3.converted, 1);
+    eq("…lý do ghi rõ 3 → 4", (await pid("P2")).stop_reason, "Chốt đơn mới trên POS (3 → 4)");
+
+    // Khách quay lại chuỗi mới phải được cấp mốc chuẩn MỚI
+    const posP2 = await pid("P2");
+    await query(`UPDATE customers SET status = 'expired', last_interaction_at = now() - interval '10 days' WHERE id = $1`, [posP2.id]);
+    const back = await customersRepo.upsertBatch(pPage.id, [mk("P2", 0.1)]);
+    eq("P2 quay lại chuỗi", back.rejoined, 1);
+    await customersRepo.resetPosBaseline(back.rejoinedIds);
+    eq("⭐ Mốc chuẩn bị xoá khi vào chuỗi mới", (await pid("P2")).order_count_baseline, null);
+    const r4 = await customersRepo.applyPosOrders(pPage.id, [{ psid: "P2", orderCount: 4 }], "increase");
+    eq("…lượt POS kế tiếp ghi mốc mới = 4, không converted oan", [r4.baselineSet, r4.converted], [1, 0]);
+    eq("…P2 vẫn active trong chuỗi mới", (await pid("P2")).status, "active");
+    const r5 = await customersRepo.applyPosOrders(pPage.id, [{ psid: "P2", orderCount: 5 }], "increase");
+    eq("…mua tiếp đơn thứ 5 → converted trong chuỗi mới", r5.converted, 1);
+
+    // mode 'any': ai từng có đơn đều dừng
+    await customersRepo.upsertBatch(pPage.id, [mk("P4", 1)]);
+    await customersRepo.applyPosOrders(pPage.id, [{ psid: "P4", orderCount: 7 }], "increase");
+    eq("mode increase: P4 có 7 đơn cũ vẫn active", (await pid("P4")).status, "active");
+    const rAny = await customersRepo.applyPosOrders(pPage.id, [{ psid: "P4", orderCount: 7 }], "any");
+    eq("mode any: P4 converted ngay", rAny.converted, 1);
+    eq("…lý do khác hẳn", (await pid("P4")).stop_reason, "Đã có đơn trên POS (7)");
+
+    // Không đụng tới khách đã dừng vì lý do khác
+    await customersRepo.upsertBatch(pPage.id, [mk("P5", 1)]);
+    const posP5 = await pid("P5");
+    await customersRepo.stop(posP5.id, "opted_out", "Khách từ chối");
+    await customersRepo.applyPosOrders(pPage.id, [{ psid: "P5", orderCount: 9 }], "any");
+    eq("Khách opted_out không bị POS ghi đè thành converted", (await customersRepo.findById(posP5.id))?.status, "opted_out");
+
+    // psid không có trong tệp thì bỏ qua, không tạo dòng mới
+    const beforeCount = (await queryOne<{ n: number }>(`SELECT COUNT(*)::int AS n FROM customers WHERE page_id = $1`, [pPage.id]))?.n;
+    await customersRepo.applyPosOrders(pPage.id, [{ psid: "KHONG_CO_TRONG_TEP", orderCount: 5 }], "increase");
+    eq("psid lạ từ POS không tạo khách mới", (await queryOne<{ n: number }>(`SELECT COUNT(*)::int AS n FROM customers WHERE page_id = $1`, [pPage.id]))?.n, beforeCount);
+
+    await query(`DELETE FROM pages WHERE page_id = 'SMOKE_POS'`);
 
     await closePool();
 } catch (err) {

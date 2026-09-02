@@ -71,6 +71,9 @@ export interface Customer {
     status: CustomerStatus;
     stop_reason: string | null;
     stopped_at: Date | null;
+    /** Số đơn POS lúc khách vào chuỗi. NULL = chưa đối chiếu POS lần nào. */
+    order_count_baseline: number | null;
+    pos_checked_at: Date | null;
 }
 
 /** Khách vừa quét được từ Pancake, chưa vào DB. */

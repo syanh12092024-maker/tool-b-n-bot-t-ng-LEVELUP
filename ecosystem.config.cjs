@@ -41,6 +41,15 @@ module.exports = {
             env: { NODE_ENV: "production" },
         },
         {
+            // Đối chiếu đơn POS: mỗi 15 phút, lệch pha với health cho đỡ dồn tải
+            name: "banbot-pos",
+            script: "dist/jobs/pos.js",
+            cwd,
+            autorestart: false,
+            cron_restart: "8,23,38,53 * * * *",
+            env: { NODE_ENV: "production" },
+        },
+        {
             // Giám sát sức khoẻ page: mỗi 15 phút
             name: "banbot-health",
             script: "dist/jobs/health.js",
