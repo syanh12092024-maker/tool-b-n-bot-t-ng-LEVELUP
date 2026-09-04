@@ -21,6 +21,8 @@ export interface JobArgs {
     loop: boolean;
     /** --dry-run: tính toán nhưng không ghi/gửi */
     dryRun: boolean;
+    /** --so <n>: giới hạn số bản ghi xử lý (job nào không dùng thì bỏ qua) */
+    so: number | null;
 }
 
 export function parseJobArgs(): JobArgs {
@@ -30,14 +32,17 @@ export function parseJobArgs(): JobArgs {
             force: { type: "boolean", default: false },
             loop: { type: "boolean", default: false },
             "dry-run": { type: "boolean", default: false },
+            so: { type: "string" },
         },
         strict: false,
     });
+    const so = typeof values.so === "string" ? Number(values.so) : NaN;
     return {
         page: typeof values.page === "string" ? values.page.trim() : null,
         force: values.force === true,
         loop: values.loop === true,
         dryRun: values["dry-run"] === true,
+        so: Number.isFinite(so) && so > 0 ? Math.floor(so) : null,
     };
 }
 

@@ -698,6 +698,84 @@ try {
     await new Promise<void>((r) => web2.close(() => r()));
     await query(`DELETE FROM pages WHERE page_id = 'SMOKE_EDIT'`);
 
+    // ═══ 18. PHÂN TÍCH HỘI THOẠI ════════════════════════════════════════════
+    section("Phân tích hội thoại (không dùng AI)");
+    const ca = await import("../domain/chat-analysis.js");
+    const pc = await import("../clients/pancake.js");
+
+    // Bóc HTML — Pancake gói tin trong thẻ và trả cả thực thể dạng số
+    eq("stripHtml bóc thẻ div", pc.stripHtml("<div>Xin chào</div>"), "Xin chào");
+    eq("stripHtml đổi <br> thành xuống dòng", pc.stripHtml("a<br>b"), "a\nb");
+    eq("⭐ stripHtml xử lý &apos; (từng lọt vào bảng cụm từ như một từ thật)",
+        pc.stripHtml("<div>don&apos;t worry</div>"), "don't worry");
+    eq("stripHtml xử lý thực thể dạng số", pc.stripHtml("it&#39;s ok"), "it's ok");
+    eq("stripHtml xử lý thực thể hex", pc.stripHtml("it&#x27;s ok"), "it's ok");
+
+    // Nhận ngôn ngữ theo bảng chữ cái
+    eq("Nhận tiếng Ả Rập", ca.detectLang("كم السعر؟"), "ar");
+    eq("Nhận tiếng Anh", ca.detectLang("How much are the dentures?"), "latin");
+    eq("Nhận tiếng Nhật", ca.detectLang("いくらですか"), "ja");
+    eq("Nhận tiếng Việt (dấu)", ca.detectLang("giá bao nhiêu vậy"), "vi");
+    eq("Chuỗi rỗng → không rõ", ca.detectLang("   "), "unknown");
+
+    // Rút giá
+    eq("Giá dạng '100 SAR'", ca.extractPrices("only 100 SAR today"), [{ amount: 100, currency: "SAR" }]);
+    eq("Giá dạng 'SAR 100'", ca.extractPrices("SAR 100 for both"), [{ amount: 100, currency: "SAR" }]);
+    eq("Giá tiếng Ả Rập", ca.extractPrices("100 ريال فقط"), [{ amount: 100, currency: "ريال" }]);
+    eq("Bỏ qua số không có đơn vị tiền", ca.extractPrices("call me at 0501234567"), []);
+
+    // Số điện thoại
+    eq("Nhận số điện thoại Ả Rập Xê Út", ca.looksLikePhone("0501764432"), true);
+    eq("Không nhận số quá ngắn", ca.looksLikePhone("100 SAR"), false);
+
+    // ⭐ Ranh giới từ tiếng Ả Rập — lỗi thật tìm được khi đọc kết quả trên dữ liệu sống
+    const store = ca.OBJECTION_GROUPS.find((g) => g.key === "store")!;
+    eq("⭐ 'محلول' (dung dịch) KHÔNG bị nhận là 'محل' (cửa hàng)", store.re.test("هل يحتاج لمحلول"), false);
+    eq("…'محل' đứng riêng vẫn nhận đúng", store.re.test("عندكم محل"), true);
+    eq("…⭐ 'المحل' (có mạo từ ال) vẫn nhận đúng", store.re.test("وين المحل"), true);
+    eq("…'للمحل' (tiền tố لل) vẫn nhận đúng", store.re.test("رايح للمحل"), true);
+    eq("…'لمحلول' (cho dung dịch) vẫn KHÔNG khớp", store.re.test("احتاج لمحلول"), false);
+    eq("…và 'فرع' (chi nhánh) vẫn nhận đúng", store.re.test("هل لديكم فرع"), true);
+
+    const scam = ca.OBJECTION_GROUPS.find((g) => g.key === "scam")!;
+    eq("Bắt được 'scam'", scam.re.test("this page is a scam"), true);
+    eq("Bắt được 'نصابين'", scam.re.test("نصابين"), true);
+    eq("Không bắt nhầm 'scamper'", scam.re.test("the scamper ran"), false);
+
+    // Cụm từ hay gặp
+    const phrases = ca.topPhrases(
+        ["How much are the dentures?", "how much dentures", "How much?", "where is your shop"],
+        { minCount: 2, limit: 5 });
+    check("Tìm ra cụm 'much' xuất hiện 3 lần", phrases.some((p) => p.phrase.includes("much") && p.count === 3));
+    check("Bỏ từ vô nghĩa (the/are/is)", !phrases.some((p) => p.phrase === "the" || p.phrase === "are"));
+
+    // Phân tích một hội thoại giả lập đầy đủ
+    const PAGE = "PAGE_X";
+    const caConv = ca.analyzeConversation([
+        { fromPage: false, senderName: "Ali", text: "How much are the dentures?", at: null, adText: "Quảng cáo NESLEMY" },
+        { fromPage: true,  senderName: "Page", text: "100 SAR for upper and lower dentures", at: null, adText: null },
+        { fromPage: false, senderName: "Ali", text: "is it a scam?", at: null, adText: null },
+        { fromPage: true,  senderName: "Page", text: "Please send your full name, phone and address", at: null, adText: null },
+        { fromPage: false, senderName: "Ali", text: "Ali Hassan 0501234567 Riyadh", at: null, adText: null },
+    ]);
+    eq("Đếm đúng tin của khách", caConv.customerMessages.length, 3);
+    eq("Đếm đúng tin của page", caConv.pageMessages.length, 2);
+    eq("Câu mở lời của khách", caConv.firstCustomerMessage, "How much are the dentures?");
+    eq("Nhận ra khách đã để lại SĐT", caConv.gavePhone, true);
+    eq("⭐ Bắt đúng câu page nói NGAY TRƯỚC khi khách đưa số",
+        caConv.lineBeforePhone, "Please send your full name, phone and address");
+    eq("Khách hỏi giá ngay lượt đầu", caConv.priceAskedAtTurn, 1);
+    eq("Rút được giá từ lời page", caConv.prices, [{ amount: 100, currency: "SAR" }]);
+    eq("Lấy được nội dung quảng cáo", caConv.adText, "Quảng cáo NESLEMY");
+
+    const caRep = ca.buildReport([caConv]);
+    eq("Báo cáo: 1 hội thoại có khách nhắn", caRep.withCustomerMessage, 1);
+    eq("Báo cáo: tỉ lệ để lại SĐT 100%", caRep.phoneRate, 1);
+    check("Báo cáo bắt được vấn đề 'nghi lừa đảo'", caRep.objections.some((o) => o.key === "scam" && o.count === 1));
+    check("Báo cáo có trích dẫn thật kèm theo",
+        (caRep.objections.find((o) => o.key === "scam")?.samples[0] ?? "").includes("scam"));
+    eq("Báo cáo: giá hay báo nhất", caRep.prices[0], { currency: "SAR", amount: 100, count: 1 });
+
     await closePool();
 } catch (err) {
     failed++;

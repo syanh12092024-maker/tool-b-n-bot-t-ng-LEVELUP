@@ -375,3 +375,86 @@ export async function ping(): Promise<{ ok: boolean; pageCount: number; error?: 
 }
 
 export { maskUrl };
+
+// ─── Đọc nội dung hội thoại (phục vụ phân tích, KHÔNG dùng khi gửi) ──────────
+
+export interface ChatMessage {
+    /** true = tin của page (nhân viên/bot), false = tin của khách */
+    fromPage: boolean;
+    senderName: string;
+    text: string;
+    at: Date | null;
+    /** Nội dung quảng cáo đã kéo khách vào hội thoại này, nếu có */
+    adText: string | null;
+}
+
+/**
+ * Bóc chữ ra khỏi HTML mà Pancake trả về.
+ *
+ * Pancake gói tin trong <div>…</div>, đôi khi có <br> và thực thể HTML. Không
+ * dùng thư viện phân tích HTML vì đây là chuỗi rất đơn giản và ta chỉ cần chữ.
+ */
+export function stripHtml(html: string): string {
+    return String(html ?? "")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/(p|div|li)>/gi, "\n")
+        .replace(/<[^>]*>/g, "")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        // Thực thể dạng số (&#39; &#x27; …) — Pancake trả cả hai kiểu.
+        // Thiếu bước này thì "apos" lọt vào bảng xếp hạng cụm từ như một từ thật.
+        .replace(/&#(\d+);/g, (_, d: string) => String.fromCodePoint(Number(d)))
+        .replace(/&#x([0-9a-f]+);/gi, (_, h: string) => String.fromCodePoint(parseInt(h, 16)))
+        .replace(/&[a-z]+;/gi, " ")
+        .replace(/[ \t]+/g, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+}
+
+interface RawMessage {
+    message?: string;
+    from?: { id?: string; name?: string };
+    inserted_at?: string;
+    attachments?: Array<{ post_attachments?: Array<{ description?: string }> }>;
+}
+
+/** Toàn bộ tin nhắn của một hội thoại, đã bóc chữ và phân biệt ai gửi. */
+export async function fetchMessages(pageId: string, conversationId: string): Promise<ChatMessage[]> {
+    const token = await getPageToken(pageId);
+    if (!token) return [];
+
+    const url = `${config.pancake.publicApiUrl}/pages/${pageId}/conversations/${conversationId}/messages?page_access_token=${token}`;
+    const data = await tryFetchJson<{ messages?: RawMessage[]; data?: RawMessage[] }>(url, {
+        label: "pancake.messages",
+        timeoutMs: 20_000,
+        retries: 2,
+    });
+    if (!data) return [];
+
+    const raw = data.messages ?? data.data ?? [];
+    return raw.map((m): ChatMessage => {
+        const at = m.inserted_at ? new Date(m.inserted_at) : null;
+        // Quảng cáo nằm lồng trong attachments — đây là lời chào hàng đã kéo khách vào
+        let adText: string | null = null;
+        for (const a of m.attachments ?? []) {
+            for (const p of a.post_attachments ?? []) {
+                if (p.description && p.description.length > 30) {
+                    adText = stripHtml(p.description);
+                    break;
+                }
+            }
+            if (adText) break;
+        }
+        return {
+            fromPage: String(m.from?.id ?? "") === String(pageId),
+            senderName: String(m.from?.name ?? ""),
+            text: stripHtml(m.message ?? ""),
+            at: at && !isNaN(at.getTime()) ? at : null,
+            adText,
+        };
+    });
+}

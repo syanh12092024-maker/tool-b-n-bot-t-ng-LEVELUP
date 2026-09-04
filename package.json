@@ -25,7 +25,8 @@
     "test:smoke": "tsx src/scripts/smoke-test.ts",
     "job:pos": "tsx src/jobs/pos.ts",
     "web": "tsx src/web/server.ts",
-    "seed:demo": "tsx src/scripts/seed-demo.ts"
+    "seed:demo": "tsx src/scripts/seed-demo.ts",
+    "chat:phan-tich": "tsx src/scripts/phan-tich-chat.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
