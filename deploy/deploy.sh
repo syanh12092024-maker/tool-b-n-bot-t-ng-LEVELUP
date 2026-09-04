@@ -32,4 +32,4 @@ ssh "$HOST" "cd $DIR \
 echo "▶ Kiểm tra dashboard còn sống…"
 ssh "$HOST" "curl -sf -o /dev/null -w 'healthz → HTTP %{http_code}\n' http://127.0.0.1:3110/healthz"
 
-echo "✅ Xong → https://169.58.33.8:8446"
+echo "✅ Xong → https://$(ssh -G \"$HOST\" | awk '/^hostname /{print $2}'):8446"

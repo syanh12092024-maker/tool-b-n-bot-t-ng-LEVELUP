@@ -1,10 +1,11 @@
 # Vận hành trên VPS
 
-Máy chủ `talpha-server` (169.58.33.8), Ubuntu 24.04. Cài tại `/opt/banbot`.
+Máy chủ: host `talpha-server` trong `~/.ssh/config` (repo này công khai nên không
+ghi địa chỉ thật ở đây). Ubuntu 24.04, cài tại `/opt/banbot`.
 
 | Thành phần | Giá trị |
 |---|---|
-| Dashboard | https://169.58.33.8:8446 (nginx → 127.0.0.1:3110) |
+| Dashboard | `https://<IP máy chủ>:8446` (nginx → 127.0.0.1:3110) |
 | Webhook | 127.0.0.1:3111 (chưa mở ra ngoài) |
 | Database | PostgreSQL 16, database `banbot`, user `banbot` |
 | Bí mật | `/opt/banbot/.env` (chmod 600) — KHÔNG có trong git |
