@@ -48,6 +48,76 @@ const GOI_Y = [
     "Tin cuối, để ngỏ cửa quay lại",
 ];
 
+// ─── Ý nghĩa từng loại lỗi ────────────────────────────────────────────────────
+// Chỉ hiện mã lỗi kiểu PAGE_BLOCKED thì người vận hành không biết phải làm gì.
+// Mỗi loại kèm luôn: nghĩa là gì, và có cần làm gì không.
+const LOI: Record<string, { ten: string; lam: string; nang: "bad" | "warn" | "muted" }> = {
+    PAGE_QUOTA: {
+        ten: "Pancake hết gói cước",
+        lam: "Nạp thêm gói cho page này. Engine đã tự ngưng page và sẽ thử lại sau 30 phút.",
+        nang: "bad",
+    },
+    PAGE_BLOCKED: {
+        ten: "Facebook chặn page (#2022)",
+        lam: "Đang gửi quá dày. Engine đã tự ngưng page 30 phút. Lặp lại nhiều lần thì phải giảm số tin mỗi ngày.",
+        nang: "bad",
+    },
+    OUT_OF_WINDOW: {
+        ten: "Khách quá 7 ngày chưa nhắn",
+        lam: "Không sửa được — Facebook không cho nhắn nữa. Cần chạy quảng cáo để có khách mới vào inbox.",
+        nang: "muted",
+    },
+    USER_UNAVAILABLE: {
+        ten: "Khách chặn tin hoặc đã xoá tài khoản",
+        lam: "Bỏ qua, không làm gì được.",
+        nang: "muted",
+    },
+    TOKEN_EXPIRED: {
+        ten: "Token hết hạn",
+        lam: "Engine tự làm mới token rồi thử lại. Nếu lặp lại liên tục, cần lấy token Pancake mới.",
+        nang: "warn",
+    },
+    RATE_LIMITED: {
+        ten: "Gửi quá nhanh",
+        lam: "Engine tự hãm tốc. Không cần làm gì.",
+        nang: "warn",
+    },
+    INVALID_RECIPIENT: {
+        ten: "Mã khách sai định dạng",
+        lam: "Dữ liệu đồng bộ có vấn đề. Chạy lại job sync cho page này.",
+        nang: "warn",
+    },
+    NETWORK: {
+        ten: "Mất mạng hoặc Pancake không phản hồi",
+        lam: "Thường tự khỏi. Engine sẽ thử lại ở lượt sau.",
+        nang: "warn",
+    },
+    UNKNOWN: {
+        ten: "Lỗi chưa phân loại",
+        lam: "Xem nội dung lỗi bên cạnh để biết chi tiết.",
+        nang: "warn",
+    },
+};
+
+interface MonitorData {
+    totals: {
+        queued: number; sending: number; sent24: number; failed24: number;
+        converted24: number; errorRate: number; lastSend: string; nextDue: string;
+    };
+    pages: Array<{
+        pageId: string; name: string; market: string; isActive: boolean; health: string;
+        pausedUntil: string; pauseReason: string | null; queued: number;
+        sent24: number; failed24: number; errorRate: number; lastSend: string; nextDue: string;
+    }>;
+    feed: Array<{
+        at: string; page: string; customer: string; psid: string; msgIndex: number | null;
+        journeyDay: number | null; slotIndex: number | null; channel: string; fbTag: string | null;
+        success: boolean; errorKind: string | null; errorMessage: string | null;
+    }>;
+    errors: Array<{ kind: string; count: number; pages: number; sample: string | null; lastAt: string }>;
+    at: string;
+}
+
 // ─── Kiểu dữ liệu ─────────────────────────────────────────────────────────────
 interface PageInfo {
     pageId: string;
@@ -94,7 +164,7 @@ interface Schedule {
     health: string;
 }
 
-type Screen = "tong-quan" | "kich-ban" | "ban-tay";
+type Screen = "tong-quan" | "theo-doi" | "kich-ban" | "ban-tay";
 
 // ─── Gọi API ──────────────────────────────────────────────────────────────────
 const KEY_STORE = "banbot_key";
@@ -310,6 +380,295 @@ function OverviewScreen({
                                                     Bắn tay
                                                 </button>
                                             </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+// ═══ MÀN HÌNH · THEO DÕI ══════════════════════════════════════════════════════
+
+function clock(iso: string): string {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return "—";
+    return d.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function pct(n: number): string {
+    return `${(n * 100).toFixed(n > 0 && n < 0.1 ? 1 : 0)}%`;
+}
+
+function MonitorScreen({
+    data,
+    loading,
+    paused,
+    onTogglePause,
+    onRefresh,
+    onOpenPage,
+}: {
+    data: MonitorData | null;
+    loading: boolean;
+    paused: boolean;
+    onTogglePause: () => void;
+    onRefresh: () => void;
+    onOpenPage: (pageId: string) => void;
+}) {
+    if (!data) {
+        return (
+            <div className="panel">
+                <Empty title={loading ? "Đang tải số liệu…" : "Chưa có số liệu"} />
+            </div>
+        );
+    }
+
+    const t = data.totals;
+    const daGui = t.sent24 + t.failed24 > 0;
+
+    return (
+        <div className="space-y-5">
+            {/* Số liệu 24 giờ */}
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+                <Stat
+                    value={num(t.queued)}
+                    label="Đang chờ gửi"
+                    hint={t.nextDue ? `lượt gần nhất ${clock(t.nextDue)}` : "hàng đợi trống"}
+                    tone={t.queued > 0 ? "var(--brand)" : undefined}
+                />
+                <Stat value={num(t.sent24)} label="Đã gửi 24h" hint="tin đi thành công" tone="var(--ok)" />
+                <Stat
+                    value={num(t.failed24)}
+                    label="Lỗi 24h"
+                    hint={daGui ? `tỉ lệ ${pct(t.errorRate)}` : "chưa gửi gì"}
+                    tone={t.failed24 > 0 ? "var(--bad)" : undefined}
+                />
+                <Stat value={num(t.converted24)} label="Chốt đơn 24h" hint="đã dừng chuỗi" tone="var(--ok)" />
+                <Stat
+                    value={t.lastSend ? clock(t.lastSend) : "—"}
+                    label="Lần gửi cuối"
+                    hint={t.lastSend ? ago(t.lastSend) : "chưa gửi lần nào"}
+                />
+            </div>
+
+            {/* Lỗi — phần quan trọng nhất */}
+            <div className="panel overflow-hidden">
+                <div
+                    className="flex flex-wrap items-center justify-between gap-2 border-b px-5 py-3.5"
+                    style={{ borderColor: "var(--line)" }}
+                >
+                    <div>
+                        <h2 className="text-[15px] font-bold">Lỗi trong 24 giờ qua</h2>
+                        <p className="mt-0.5 text-[12.5px]" style={{ color: "var(--ink-3)" }}>
+                            Mỗi dòng kèm luôn ý nghĩa và việc cần làm
+                        </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <button className="btn btn-ghost btn-sm" onClick={onTogglePause}>
+                            {paused ? "Tiếp tục tự cập nhật" : "Tạm dừng tự cập nhật"}
+                        </button>
+                        <button className="btn btn-ghost btn-sm" onClick={onRefresh}>
+                            Cập nhật ngay
+                        </button>
+                    </div>
+                </div>
+
+                {data.errors.length === 0 ? (
+                    <Empty title="Không có lỗi nào" hint="Trong 24 giờ qua mọi tin đều gửi được." />
+                ) : (
+                    <div className="divide-y" style={{ borderColor: "var(--line-soft)" }}>
+                        {data.errors.map((e) => {
+                            const info = LOI[e.kind] ?? LOI.UNKNOWN!;
+                            return (
+                                <div key={e.kind} className="flex flex-wrap gap-x-4 gap-y-1.5 px-5 py-3.5">
+                                    <div className="w-16 shrink-0">
+                                        <div
+                                            className="num text-[19px] font-bold leading-none"
+                                            style={{ color: `var(--${info.nang === "muted" ? "ink-2" : info.nang})` }}
+                                        >
+                                            {num(e.count)}
+                                        </div>
+                                        <div className="mt-0.5 text-[11px]" style={{ color: "var(--ink-3)" }}>
+                                            {e.pages > 1 ? `${e.pages} page` : "1 page"}
+                                        </div>
+                                    </div>
+                                    <div className="min-w-[240px] flex-1">
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <span className="text-[14px] font-bold">{info.ten}</span>
+                                            <Chip kind={info.nang}>{e.kind}</Chip>
+                                            <span className="text-[11.5px]" style={{ color: "var(--ink-3)" }}>
+                                                gần nhất {ago(e.lastAt)}
+                                            </span>
+                                        </div>
+                                        <p className="mt-1 text-[13px]" style={{ color: "var(--ink-2)" }}>
+                                            {info.lam}
+                                        </p>
+                                        {e.sample && (
+                                            <p className="mono mt-1 break-all" style={{ color: "var(--ink-3)" }}>
+                                                {e.sample.slice(0, 160)}
+                                            </p>
+                                        )}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                )}
+            </div>
+
+            {/* Theo từng page */}
+            <div className="panel overflow-hidden">
+                <div className="border-b px-5 py-3.5" style={{ borderColor: "var(--line)" }}>
+                    <h2 className="text-[15px] font-bold">Từng page gửi ra sao</h2>
+                </div>
+                <div className="overflow-x-auto">
+                    <table className="tbl min-w-[820px]">
+                        <thead>
+                            <tr>
+                                <th>Page</th>
+                                <th>Trạng thái</th>
+                                <th className="text-right">Đã gửi 24h</th>
+                                <th className="text-right">Lỗi 24h</th>
+                                <th className="text-right">Tỉ lệ lỗi</th>
+                                <th className="text-right">Đang chờ</th>
+                                <th>Gửi lần cuối</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {data.pages.map((p) => (
+                                <tr key={p.pageId} className="cursor-pointer" onClick={() => onOpenPage(p.pageId)}>
+                                    <td>
+                                        <div className="font-semibold">{p.name}</div>
+                                        <div className="mono" style={{ color: "var(--ink-3)" }}>
+                                            {p.market}
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <PageStateChip p={p} />
+                                        {p.health === "paused" && p.pauseReason && (
+                                            <div className="mt-0.5 text-[11.5px]" style={{ color: "var(--bad)" }}>
+                                                {p.pauseReason}
+                                            </div>
+                                        )}
+                                    </td>
+                                    <td className="num text-right font-semibold">{num(p.sent24)}</td>
+                                    <td
+                                        className="num text-right"
+                                        style={{ color: p.failed24 > 0 ? "var(--bad)" : "var(--ink-3)" }}
+                                    >
+                                        {p.failed24 > 0 ? num(p.failed24) : "—"}
+                                    </td>
+                                    <td
+                                        className="num text-right"
+                                        style={{
+                                            color:
+                                                p.errorRate > 0.3
+                                                    ? "var(--bad)"
+                                                    : p.errorRate > 0
+                                                      ? "var(--warn)"
+                                                      : "var(--ink-3)",
+                                        }}
+                                    >
+                                        {p.sent24 + p.failed24 > 0 ? pct(p.errorRate) : "—"}
+                                    </td>
+                                    <td className="num text-right">{p.queued > 0 ? num(p.queued) : "—"}</td>
+                                    <td style={{ color: "var(--ink-3)" }}>{p.lastSend ? ago(p.lastSend) : "chưa gửi"}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            {/* Dòng chảy từng tin */}
+            <div className="panel overflow-hidden">
+                <div
+                    className="flex items-center justify-between border-b px-5 py-3.5"
+                    style={{ borderColor: "var(--line)" }}
+                >
+                    <h2 className="text-[15px] font-bold">Từng tin vừa gửi</h2>
+                    <span className="text-[12px]" style={{ color: "var(--ink-3)" }}>
+                        {paused ? "đã tạm dừng cập nhật" : "tự cập nhật mỗi 10 giây"} · lúc {clock(data.at)}
+                    </span>
+                </div>
+
+                {data.feed.length === 0 ? (
+                    <Empty
+                        title="Chưa gửi tin nào"
+                        hint="Khi engine bắt đầu gửi, từng tin sẽ hiện ở đây kèm kết quả."
+                    />
+                ) : (
+                    <div className="max-h-[58vh] overflow-auto">
+                        <table className="tbl min-w-[900px]">
+                            <thead className="sticky top-0 z-10">
+                                <tr>
+                                    <th className="w-20">Lúc</th>
+                                    <th>Page</th>
+                                    <th>Khách</th>
+                                    <th className="text-right">Tin</th>
+                                    <th>Kênh</th>
+                                    <th>Kết quả</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {data.feed.map((f, i) => (
+                                    <tr key={`${f.at}-${f.psid}-${i}`}>
+                                        <td className="mono" style={{ color: "var(--ink-3)" }}>
+                                            {clock(f.at)}
+                                        </td>
+                                        <td style={{ color: "var(--ink-2)" }}>{f.page}</td>
+                                        <td>
+                                            <div className="font-medium">{f.customer}</div>
+                                            <div className="mono" style={{ color: "var(--ink-3)" }}>
+                                                {f.psid}
+                                            </div>
+                                        </td>
+                                        <td className="num text-right">
+                                            {f.msgIndex ? (
+                                                <>
+                                                    <span className="font-semibold">#{f.msgIndex}</span>
+                                                    {f.journeyDay && (
+                                                        <span
+                                                            className="ml-1 text-[11.5px]"
+                                                            style={{ color: "var(--ink-3)" }}
+                                                        >
+                                                            ngày {f.journeyDay}
+                                                        </span>
+                                                    )}
+                                                </>
+                                            ) : (
+                                                <Chip kind="muted">bắn tay</Chip>
+                                            )}
+                                        </td>
+                                        <td>
+                                            <Chip kind={f.channel === "pancake" ? "brand" : "muted"}>
+                                                {f.channel === "pancake" ? "Pancake" : "Facebook"}
+                                            </Chip>
+                                        </td>
+                                        <td>
+                                            {f.success ? (
+                                                <Chip kind="ok">gửi được</Chip>
+                                            ) : (
+                                                <div className="flex flex-wrap items-center gap-1.5">
+                                                    <Chip kind={LOI[f.errorKind ?? "UNKNOWN"]?.nang ?? "warn"}>
+                                                        {LOI[f.errorKind ?? "UNKNOWN"]?.ten ?? f.errorKind}
+                                                    </Chip>
+                                                    {f.errorMessage && (
+                                                        <span
+                                                            className="mono"
+                                                            style={{ color: "var(--ink-3)" }}
+                                                            title={f.errorMessage}
+                                                        >
+                                                            {f.errorMessage.slice(0, 44)}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            )}
                                         </td>
                                     </tr>
                                 ))}
@@ -825,6 +1184,10 @@ export default function App() {
     const [sending, setSending] = useState(false);
     const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
 
+    const [monitor, setMonitor] = useState<MonitorData | null>(null);
+    const [loadingMonitor, setLoadingMonitor] = useState(false);
+    const [monitorPaused, setMonitorPaused] = useState(false);
+
     const [toast, setToast] = useState<{ text: string; kind: "ok" | "bad" } | null>(null);
     const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -878,6 +1241,30 @@ export default function App() {
         },
         [say]
     );
+
+    const loadMonitor = useCallback(async () => {
+        setLoadingMonitor(true);
+        try {
+            const r = await apiFetch("/api/monitor");
+            const d = await r.json();
+            if (!r.ok) throw new Error(d.error);
+            setMonitor(d);
+        } catch {
+            /* im lặng: vòng tự cập nhật không nên spam thông báo lỗi */
+        } finally {
+            setLoadingMonitor(false);
+        }
+    }, []);
+
+    // Tự cập nhật mỗi 10 giây khi đang mở màn hình Theo dõi. Dừng khi rời màn
+    // hình hoặc khi người dùng bấm tạm dừng — tránh gọi API vô ích cả ngày.
+    useEffect(() => {
+        if (screen !== "theo-doi") return;
+        void loadMonitor();
+        if (monitorPaused) return;
+        const id = setInterval(() => void loadMonitor(), 10_000);
+        return () => clearInterval(id);
+    }, [screen, monitorPaused, loadMonitor]);
 
     // Đổ nội dung kịch bản vào ô soạn theo segIdx — KHÔNG theo vị trí mảng, vì
     // kịch bản chỉ chứa các ô có nội dung, đổ theo vị trí sẽ lệch khung giờ.
@@ -1052,6 +1439,7 @@ export default function App() {
 
     const NAV: Array<{ key: Screen; label: string; needsPage: boolean }> = [
         { key: "tong-quan", label: "Tổng quan", needsPage: false },
+        { key: "theo-doi", label: "Theo dõi", needsPage: false },
         { key: "kich-ban", label: "Kịch bản tự động", needsPage: true },
         { key: "ban-tay", label: "Bắn tay", needsPage: true },
     ];
@@ -1144,7 +1532,18 @@ export default function App() {
                     <OverviewScreen pages={pages} loading={loadingPages} onPick={goto} />
                 )}
 
-                {screen !== "tong-quan" && !page && (
+                {screen === "theo-doi" && (
+                    <MonitorScreen
+                        data={monitor}
+                        loading={loadingMonitor}
+                        paused={monitorPaused}
+                        onTogglePause={() => setMonitorPaused((v) => !v)}
+                        onRefresh={() => void loadMonitor()}
+                        onOpenPage={(pid) => goto(pid, "kich-ban")}
+                    />
+                )}
+
+                {screen !== "tong-quan" && screen !== "theo-doi" && !page && (
                     <div className="panel">
                         <Empty
                             title="Chưa chọn page"
