@@ -91,12 +91,14 @@ export interface QueueJob {
     id: number;
     customer_id: number;
     page_id: number;
-    script_message_id: number;
+    script_message_id: number | null;
     journey_day: number;
     slot_index: number;
     scheduled_at: Date;
     state: QueueState;
     attempt_count: number;
+    /** true = người dùng bấm gửi từ giao diện, không thuộc chuỗi nuôi dưỡng */
+    manual?: boolean;
 }
 
 /** Một job kèm đủ dữ liệu để gửi, không cần truy vấn thêm. */

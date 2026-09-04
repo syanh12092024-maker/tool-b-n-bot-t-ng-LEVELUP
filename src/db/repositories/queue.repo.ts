@@ -24,7 +24,10 @@ export async function enqueueBatch(rows: EnqueueRow[]): Promise<number> {
     const inserted = await query<{ id: number }>(
         `INSERT INTO send_queue (customer_id, page_id, script_message_id, journey_day, slot_index, scheduled_at)
          SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::smallint[], $5::smallint[], $6::timestamptz[])
-         ON CONFLICT (customer_id, journey_day, slot_index) DO NOTHING
+         -- Chỉ mục chống trùng giờ là chỉ mục MỘT PHẦN (chỉ áp cho lượt theo lịch),
+         -- nên ON CONFLICT phải lặp lại đúng điều kiện WHERE, không thì Postgres
+         -- báo "no unique or exclusion constraint matching the ON CONFLICT".
+         ON CONFLICT (customer_id, journey_day, slot_index) WHERE NOT manual DO NOTHING
          RETURNING id`,
         [
             rows.map((r) => r.customerId),
@@ -70,13 +73,17 @@ export function pickBatch(limit: number, workerId: string, pageDbId?: number): P
          )
          SELECT u.id, u.customer_id, u.page_id, u.script_message_id, u.journey_day, u.slot_index,
                 u.scheduled_at, u.state, u.attempt_count,
+                u.manual,
                 c.psid, c.conversation_id, c.name AS customer_name, c.last_interaction_at,
                 p.page_id AS fb_page_id, p.page_name,
-                m.body, m.media
+                -- Lượt bắn tay mang nội dung riêng; lượt theo lịch lấy từ kịch bản
+                COALESCE(NULLIF(btrim(u.override_body), ''), m.body, '') AS body,
+                CASE WHEN COALESCE(array_length(u.override_media, 1), 0) > 0
+                     THEN u.override_media ELSE COALESCE(m.media, '{}') END AS media
            FROM upd u
            JOIN customers       c ON c.id = u.customer_id
            JOIN pages           p ON p.id = u.page_id
-           JOIN script_messages m ON m.id = u.script_message_id
+           LEFT JOIN script_messages m ON m.id = u.script_message_id
           ORDER BY u.scheduled_at`,
         [limit, workerId, pageDbId ?? null]
     );
@@ -209,4 +216,61 @@ export function historyForCustomer(customerId: number, limit = 50) {
           LIMIT $2`,
         [customerId, limit]
     );
+}
+
+// ─── Bắn tay từ giao diện ─────────────────────────────────────────────────────
+
+export interface ManualSendInput {
+    pageDbId: number;
+    customerIds: number[];
+    body: string;
+    media: string[];
+}
+
+/**
+ * Đẩy một lượt gửi tay vào hàng đợi. KHÔNG tự gửi ở đây.
+ *
+ * Đây là điểm mấu chốt: nút "bắn ngay" chỉ ghi vào hàng đợi, còn việc gửi vẫn
+ * do job send lo. Nhờ vậy mọi lớp bảo vệ đều áp dụng — chống trùng, cầu dao
+ * page khi dính #2022, hãm tốc khi lỗi cao, nhật ký từng tin. Bản v1 có đường
+ * gửi riêng cho nút này nên bỏ qua sạch các lớp đó.
+ */
+export async function enqueueManual(input: ManualSendInput): Promise<number> {
+    const body = input.body.trim();
+    const media = input.media.filter((u) => u.trim());
+    if (!body && media.length === 0) {
+        throw new Error("Phải có nội dung hoặc ảnh mới gửi được");
+    }
+    if (input.customerIds.length === 0) return 0;
+
+    const rows = await query<{ id: number }>(
+        `INSERT INTO send_queue
+            (customer_id, page_id, script_message_id, journey_day, slot_index,
+             scheduled_at, manual, override_body, override_media)
+         SELECT c.id, $1, NULL, c.journey_day, 0, now(), TRUE, $3, $4
+           FROM customers c
+          WHERE c.id = ANY($2::bigint[])
+            AND c.page_id = $1
+            -- Không gửi cho khách đã chốt đơn hoặc đã từ chối nhận tin, kể cả
+            -- khi người dùng lỡ tích chọn họ trên giao diện
+            AND c.status = 'active'
+          RETURNING id`,
+        [input.pageDbId, input.customerIds, body || null, media]
+    );
+    return rows.length;
+}
+
+/** Tiến trình một đợt bắn tay, để giao diện hiện thanh chạy. */
+export async function manualProgress(pageDbId: number, since: Date) {
+    const r = await queryOne<{ queued: number; sending: number; sent: number; failed: number; skipped: number }>(
+        `SELECT COUNT(*) FILTER (WHERE state = 'queued')::int  AS queued,
+                COUNT(*) FILTER (WHERE state = 'sending')::int AS sending,
+                COUNT(*) FILTER (WHERE state = 'sent')::int    AS sent,
+                COUNT(*) FILTER (WHERE state = 'failed')::int  AS failed,
+                COUNT(*) FILTER (WHERE state = 'skipped')::int AS skipped
+           FROM send_queue
+          WHERE page_id = $1 AND manual AND created_at >= $2`,
+        [pageDbId, since]
+    );
+    return r ?? { queued: 0, sending: 0, sent: 0, failed: 0, skipped: 0 };
 }

@@ -23,6 +23,12 @@ const SHOP_TIMEZONES: Record<string, { offset: number; label: string; flag: stri
 
 // Cửa sổ gửi được: HUMAN_AGENT tag = 7 ngày kể từ tương tác cuối của khách
 const SEND_WINDOW_MS = 7 * 86400000;
+
+// Lưới soạn nội dung: 3 cụm × 4 khung giờ = 12 tin, khớp với chuỗi nuôi dưỡng
+// của engine (công thức ((ngày-1)*4 + khung) mod 12).
+const SLOT_HOURS = [6, 11, 17, 21];
+const CUM_LABELS = ["A · giới thiệu", "B · bằng chứng", "C · thúc chốt"];
+const SLOT_COUNT = SLOT_HOURS.length * CUM_LABELS.length;
 const SCHEDULE_LABELS: Record<number, string> = {
     6: "🌅 Sáng sớm",
     11: "☀️ Trưa",
@@ -274,14 +280,10 @@ export default function BroadcastTab() {
     const [isLoadingPages, setIsLoadingPages] = useState(false);
     const [customers, setCustomers] = useState<Customer[]>([]);
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-    const [msg1, setMsg1] = useState("");
-    const [msg2, setMsg2] = useState("");
-    const [msg3, setMsg3] = useState("");
-    const [msg4, setMsg4] = useState("");
-    const [media1, setMedia1] = useState<string[]>([]);
-    const [media2, setMedia2] = useState<string[]>([]);
-    const [media3, setMedia3] = useState<string[]>([]);
-    const [media4, setMedia4] = useState<string[]>([]);
+    // 12 ô soạn, bày thành lưới 3 cụm × 4 khung giờ.
+    // v1 chỉ có 4 ô rời; chuỗi nuôi dưỡng cần 12 tin xoay vòng nên gom thành mảng.
+    const [msgs, setMsgs] = useState<string[]>(() => Array(SLOT_COUNT).fill(""));
+    const [medias, setMedias] = useState<string[][]>(() => Array.from({ length: SLOT_COUNT }, () => []));
     const abortControllerRef = useRef<AbortController | null>(null);
     const [isLoadingShops, setIsLoadingShops] = useState(true);
     const [isLoadingCustomers, setIsLoadingCustomers] = useState(false);
@@ -530,31 +532,61 @@ export default function BroadcastTab() {
     };
 
     // Combine 4 message boxes
-    const messages = [msg1, msg2, msg3, msg4];
-    const mediaArrays = [media1, media2, media3, media4];
-    const setMediaArrays = [setMedia1, setMedia2, setMedia3, setMedia4];
-    const setMessages = [setMsg1, setMsg2, setMsg3, setMsg4];
-    const totalMediaCount = media1.length + media2.length + media3.length + media4.length;
+    const messages = msgs;
+    const mediaArrays = medias;
+    const setMessageAt = (i: number, v: string) =>
+        setMsgs((prev) => prev.map((x, k) => (k === i ? v : x)));
+    const setMediaAt = (i: number, fn: (prev: string[]) => string[]) =>
+        setMedias((prev) => prev.map((x, k) => (k === i ? fn(x) : x)));
+    const totalMediaCount = medias.reduce((a, m) => a + m.length, 0);
 
     // Handle multi-media upload per box
+    // Tải ảnh LÊN SERVER rồi giữ link, không nhồi base64 vào state.
+    // v1 giữ base64 nên mỗi lịch phình vài MB và ảnh phải kèm theo mọi request gửi.
+    const [uploadingBox, setUploadingBox] = useState<number | null>(null);
+
+    const uploadFiles = useCallback(async (boxIdx: number, files: File[]) => {
+        const imgs = files.filter((f) => f.type.startsWith("image/"));
+        if (imgs.length === 0) return;
+        setUploadingBox(boxIdx);
+        try {
+            const fd = new FormData();
+            for (const f of imgs) fd.append("images", f);
+            if (selectedPageId) fd.append("pageId", selectedPageId);
+            const res = await apiFetch("/api/upload", { method: "POST", body: fd });
+            const data = await res.json();
+            if (!res.ok || !data.media) {
+                showToast(`❌ Tải ảnh lỗi: ${data.error ?? res.status}`, 6000);
+                return;
+            }
+            const urls = (data.media as { url: string }[]).map((m) => m.url);
+            setMediaAt(boxIdx, (prev) => [...prev, ...urls]);
+        } catch {
+            showToast("❌ Không tải được ảnh lên (lỗi mạng)", 6000);
+        } finally {
+            setUploadingBox(null);
+        }
+    }, [selectedPageId, showToast]);
+
     const handleMediaUpload = (boxIdx: number) => (e: React.ChangeEvent<HTMLInputElement>) => {
         const files = e.target.files;
-        if (!files || files.length === 0) return;
-        const setter = setMediaArrays[boxIdx];
-        Array.from(files).forEach(file => {
-            const reader = new FileReader();
-            reader.onload = (ev) => {
-                const dataUrl = ev.target?.result as string;
-                setter(prev => [...prev, dataUrl]);
-            };
-            reader.readAsDataURL(file);
-        });
-        // Reset input so same file can be re-selected
+        if (files && files.length) void uploadFiles(boxIdx, Array.from(files));
         e.target.value = '';
     };
 
+    /** Dán ảnh thẳng từ clipboard vào ô soạn — thao tác hay dùng nhất khi lấy ảnh từ chat. */
+    const handlePaste = (boxIdx: number) => (e: React.ClipboardEvent) => {
+        const files = Array.from(e.clipboardData?.files ?? []);
+        if (files.length) { e.preventDefault(); void uploadFiles(boxIdx, files); }
+    };
+
+    const handleDrop = (boxIdx: number) => (e: React.DragEvent) => {
+        const files = Array.from(e.dataTransfer?.files ?? []);
+        if (files.length) { e.preventDefault(); void uploadFiles(boxIdx, files); }
+    };
+
     const removeMedia = (boxIdx: number, mediaIdx: number) => {
-        setMediaArrays[boxIdx](prev => prev.filter((_, i) => i !== mediaIdx));
+        setMediaAt(boxIdx, (prev) => prev.filter((_, i) => i !== mediaIdx));
     };
 
     // Get shop timezone (derived from selected page's shopName)
@@ -712,21 +744,19 @@ export default function BroadcastTab() {
         // Map theo segIdx chứ KHÔNG theo vị trí mảng — s.messages/segments chỉ chứa
         // các đoạn CÓ nội dung (vd chỉ Đoạn 2 + Đoạn 4), nếu đổ theo vị trí thì
         // nội dung 11h nhảy vào ô Đoạn 1 (6h) → lưu lại là lệch hết khung giờ
-        setMessages.forEach(setter => setter(''));
-        setMediaArrays.forEach(setter => setter([]));
-        const segs = s.segments || [];
-        if (segs.length > 0) {
-            for (const seg of segs) {
-                const i = seg.segIdx ?? 0;
-                if (i >= 0 && i < 4) {
-                    setMessages[i](seg.message || '');
-                    setMediaArrays[i](seg.media || []);
-                }
+        // Đổ theo segIdx chứ KHÔNG theo vị trí mảng: kịch bản chỉ chứa các ô CÓ
+        // nội dung, đổ theo vị trí sẽ làm tin của khung 11h nhảy vào ô khung 6h.
+        const nextMsgs: string[] = Array(SLOT_COUNT).fill('');
+        const nextMedias: string[][] = Array.from({ length: SLOT_COUNT }, () => []);
+        for (const seg of s.segments || []) {
+            const i = seg.segIdx ?? 0;
+            if (i >= 0 && i < SLOT_COUNT) {
+                nextMsgs[i] = seg.message || '';
+                nextMedias[i] = seg.media || [];
             }
-        } else {
-            // Lịch cũ chưa có segments: messages đủ 4 phần tử theo đúng vị trí ô
-            (s.messages || []).forEach((m, i) => { if (i < 4) setMessages[i](m || ''); });
         }
+        setMsgs(nextMsgs);
+        setMedias(nextMedias);
         
         // Select đúng shop + page
         if (s.shopId && s.shopId !== selectedShopId) setSelectedShopId(s.shopId);
@@ -752,210 +782,78 @@ export default function BroadcastTab() {
     const [autoBatchInfo, setAutoBatchInfo] = useState<{ currentBatch: number; totalBatches: number; totalSent: number; totalRecipients: number } | null>(null);
     const [batchCountdown, setBatchCountdown] = useState(0); // Countdown giữa các đợt
 
+    /**
+     * Bắn ngay cho những khách đang tích chọn.
+     *
+     * KHÔNG tự gửi ở trình duyệt. Chỉ đẩy vào hàng đợi, job send (chạy mỗi phút)
+     * mới gửi thật. Nhờ vậy lượt bắn tay đi qua đúng đường của engine: chống
+     * trùng, cầu dao page khi dính #2022, hãm tốc khi lỗi cao, nhật ký từng tin.
+     * Bản v1 gửi thẳng từ trình duyệt nên bỏ qua sạch các lớp bảo vệ đó.
+     */
     const handleSendBox = async (boxIdx: number) => {
-        // ═══ NUCLEAR GUARD: window-level global flag ═══
-        // Không bị reset khi React re-render, không bị bypass bởi multiple component instances
-        if ((window as unknown as Record<string, boolean>).__broadcastSending) {
-            console.warn('[broadcast] BLOCKED by window flag');
-            return;
-        }
-        if (sendingLockRef.current) {
-            console.warn('[broadcast] BLOCKED by ref lock');
-            return;
-        }
-        const cooldownLeft = 10000 - (Date.now() - lastSentTimeRef.current);
-        if (cooldownLeft > 0) {
-            showToast(`⏱️ Chờ ${Math.ceil(cooldownLeft / 1000)}s nữa rồi gửi tiếp (chống bấm trùng)`);
-            return;
-        }
-        const msg = messages[boxIdx]?.trim();
-        const boxMedia = mediaArrays[boxIdx];
-        if (selectedIds.size === 0 || (!msg && boxMedia.length === 0)) return;
+        if (sendingLockRef.current) return;
 
-        // ═══ Chỉ gửi cho filteredCustomers (đã lọc cửa sổ 7 ngày + bộ lọc) ═══
-        // Tính TRƯỚC khi khoá để có thể thoát sớm nếu rỗng
-        const allRecipients = filteredCustomers
-            .filter((c) => selectedIds.has(c.id))
-            .map((c) => ({ psid: c.psid, pageFbId: c.pageFbId, name: c.customerName, conversationId: c.id }));
-        if (allRecipients.length === 0) {
-            showToast("⚠️ Khách đã chọn không còn nằm trong bộ lọc hiện tại — chọn lại khách");
+        const msg = messages[boxIdx]?.trim() ?? "";
+        const boxMedia = mediaArrays[boxIdx] ?? [];
+        if (!msg && boxMedia.length === 0) {
+            showToast("⚠️ Ô này chưa có nội dung và cũng chưa có ảnh");
             return;
         }
+        const chosen = filteredCustomers.filter((c) => selectedIds.has(c.id));
+        if (chosen.length === 0) {
+            showToast("⚠️ Chưa chọn khách nào — tích vào ô vuông bên trái danh sách");
+            return;
+        }
+        if (!confirm(`Gửi tin ${boxIdx + 1} cho ${chosen.length} khách?\n\nTin sẽ vào hàng đợi và được gửi trong vòng 1 phút.`)) return;
 
-        // Set ALL locks
-        (window as unknown as Record<string, boolean>).__broadcastSending = true;
         sendingLockRef.current = true;
-        setSendDropdownOpen(false);
         setIsSending(true);
         setSendResults(null);
-        setSendingLog([]);
-
-        const controller = new AbortController();
-        abortControllerRef.current = controller;
-        const signal = controller.signal;
-
-        // Kết quả tích luỹ — khai báo ngoài try để khi HUỶ vẫn giữ được phần đã gửi
-        const allResults: SendResult[] = [];
+        const since = new Date().toISOString();
 
         try {
-            // Ảnh gửi trực tiếp base64 — server sẽ convert → FormData → Pancake
-            const imageData: string[] = boxMedia.length > 0 ? boxMedia : [];
+            const res = await apiFetch("/api/send", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    pageId: selectedPageId,
+                    psids: chosen.map((c) => c.psid),
+                    message: msg,
+                    media: boxMedia,
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                showToast(`❌ ${data.error ?? "Không xếp được hàng đợi"}`, 8000);
+                return;
+            }
+            showToast(`✅ ${data.message}`, 8000);
+            if (!data.pageActive) {
+                showToast("⚠️ Page đang TẮT — engine sẽ không gửi cho tới khi bật page", 10000);
+            }
 
-            // ═══ Chuẩn bị file ảnh MỘT LẦN (thay vì mỗi chunk) ═══
-            // Hỗ trợ cả data: URL lẫn http URL (từ chế độ "Sửa" lịch)
-            const imageFiles: File[] = [];
-            let skippedImages = 0;
-            for (let imgIdx = 0; imgIdx < imageData.length; imgIdx++) {
-                const imgStr = imageData[imgIdx];
+            // Theo dõi tiến trình: hỏi server cho tới khi hàng đợi rỗng
+            const deadline = Date.now() + 10 * 60_000;
+            const poll = async () => {
+                if (Date.now() > deadline) { setBatchProgress(null); return; }
                 try {
-                    const resp = await fetch(imgStr);
-                    const blob = await resp.blob();
-                    const ext = blob.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
-                    imageFiles.push(new File([blob], `img_${imgIdx}.${ext}`, { type: blob.type }));
-                } catch {
-                    skippedImages++;
-                }
-            }
-            if (skippedImages > 0) {
-                showToast(`⚠️ ${skippedImages} ảnh không tải được (URL hỏng?) — vẫn gửi phần còn lại`, 6000);
-            }
-
-            // Chia recipients thành batches
-            const batches: typeof allRecipients[] = [];
-            for (let i = 0; i < allRecipients.length; i += BATCH_SIZE) {
-                batches.push(allRecipients.slice(i, i + BATCH_SIZE));
-            }
-
-            // Khởi tạo log cho tất cả recipients
-            setSendingLog(allRecipients.map(r => ({ name: r.name, status: 'pending' as const })));
-            let globalIdx = 0; // index toàn cục across batches
-
-            for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
-                if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-
-                const batch = batches[batchIdx];
-                setAutoBatchInfo({
-                    currentBatch: batchIdx + 1,
-                    totalBatches: batches.length,
-                    totalSent: globalIdx,
-                    totalRecipients: allRecipients.length,
-                });
-
-                // ── Gửi theo CHUNK (nhiều người/request → server gửi song song) ──
-                for (let j = 0; j < batch.length; j += SEND_CHUNK) {
-                    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-
-                    const chunk = batch.slice(j, j + SEND_CHUNK);
-                    const chunkStart = globalIdx;
-                    setBatchProgress({ sent: globalIdx, total: allRecipients.length });
-
-                    // Đánh dấu cả chunk đang gửi
-                    setSendingLog(prev => prev.map((item, idx) =>
-                        (idx >= chunkStart && idx < chunkStart + chunk.length) ? { ...item, status: 'sending' as const } : item));
-                    setTimeout(() => logScrollRef.current?.scrollTo({ top: logScrollRef.current.scrollHeight, behavior: 'smooth' }), 50);
-
-                    // ═══ Gửi chunk với RETRY: tối đa 3 lần cho lỗi mạng / lỗi 5xx ═══
-                    let chunkResults: SendResult[] | null = null;
-                    let lastErr = '';
-                    for (let attempt = 0; attempt < 3 && !chunkResults; attempt++) {
-                        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-                        try {
-                            let res: Response;
-                            if (imageFiles.length > 0) {
-                                const fd = new FormData();
-                                fd.append('recipients', JSON.stringify(chunk));
-                                fd.append('message', msg || '');
-                                for (const f of imageFiles) fd.append('images', f);
-                                if (forceGraphAPI) fd.append('forceGraphAPI', 'true');
-                                res = await apiFetch("/api/broadcast", { method: "POST", body: fd, signal });
-                            } else {
-                                res = await apiFetch("/api/broadcast", {
-                                    method: "POST",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ recipients: chunk, message: msg || '', forceGraphAPI }),
-                                    signal,
-                                });
-                            }
-                            if (res.ok) {
-                                const data = await res.json();
-                                chunkResults = (data.results || []) as SendResult[];
-                            } else {
-                                const data = await res.json().catch(() => ({} as { error?: string }));
-                                lastErr = data.error || `Server lỗi HTTP ${res.status}`;
-                                if (res.status < 500) break; // 4xx: retry vô ích
-                            }
-                        } catch (err) {
-                            if (err instanceof Error && err.name === 'AbortError') throw err;
-                            lastErr = 'Lỗi mạng';
-                        }
-                        if (!chunkResults && attempt < 2) {
-                            await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
-                        }
-                    }
-
-                    if (chunkResults) {
-                        // Khớp kết quả theo psid; người thiếu trong response → đánh lỗi rõ ràng
-                        // (không để "biến mất" khỏi thống kê như trước)
-                        const byPsid = new Map(chunkResults.map((r) => [String(r.psid), r]));
-                        const fullChunk: SendResult[] = chunk.map(rcp =>
-                            byPsid.get(String(rcp.psid)) ||
-                            { psid: rcp.psid, name: rcp.name, success: false, error: 'Server không trả kết quả cho khách này' });
-                        allResults.push(...fullChunk);
-                        setSendingLog(prev => prev.map((item, idx) => {
-                            if (idx < chunkStart || idx >= chunkStart + chunk.length) return item;
-                            const r = fullChunk[idx - chunkStart];
-                            return { ...item, status: r.success ? 'success' as const : 'error' as const, error: r.error };
-                        }));
+                    const r = await apiFetch(`/api/send?pageId=${encodeURIComponent(selectedPageId)}&since=${encodeURIComponent(since)}`);
+                    const p = await r.json();
+                    setBatchProgress({ sent: p.done ?? 0, total: p.total ?? 0 });
+                    if ((p.queued ?? 0) + (p.sending ?? 0) > 0) {
+                        setTimeout(poll, 3000);
                     } else {
-                        for (const rcp of chunk) allResults.push({ psid: rcp.psid, name: rcp.name, success: false, error: lastErr });
-                        setSendingLog(prev => prev.map((item, idx) =>
-                            (idx >= chunkStart && idx < chunkStart + chunk.length) ? { ...item, status: 'error' as const, error: lastErr } : item));
+                        showToast(`📨 Xong: ${p.sent} gửi được${p.failed ? ` · ${p.failed} lỗi` : ""}${p.skipped ? ` · ${p.skipped} bỏ qua` : ""}`, 10000);
                     }
-
-                    globalIdx += chunk.length;
-                    setBatchProgress({ sent: globalIdx, total: allRecipients.length });
-                    if (j + SEND_CHUNK < batch.length) {
-                        await new Promise(resolve => setTimeout(resolve, 200));
-                    }
-                }
-
-                // ── Delay giữa các batch (trừ batch cuối) ──
-                if (batchIdx < batches.length - 1) {
-                    setAutoBatchInfo(prev => prev ? { ...prev, totalSent: globalIdx } : null);
-                    // Countdown delay
-                    for (let sec = BATCH_DELAY_SEC; sec > 0; sec--) {
-                        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-                        setBatchCountdown(sec);
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                    }
-                    setBatchCountdown(0);
-                }
-            }
-
-            setBatchProgress({ sent: allRecipients.length, total: allRecipients.length });
-            setAutoBatchInfo(prev => prev ? { ...prev, totalSent: allRecipients.length } : null);
-            setSendResults(allResults);
-
-        } catch (err: unknown) {
-            if (err instanceof Error && err.name === 'AbortError') {
-                // GIỮ kết quả đã gửi trước khi huỷ — không vứt bỏ như trước
-                setSendResults(allResults);
-                const sentOk = allResults.filter(r => r.success).length;
-                showToast(`⛔ Đã huỷ gửi — trước khi huỷ đã gửi thành công ${sentOk}/${allRecipients.length} tin`, 8000);
-            } else {
-                console.error("Broadcast error:", err);
-                setSendResults(allResults.length > 0 ? allResults : [{ psid: "error", name: "System", success: false, error: "Network error" }]);
-            }
+                } catch { /* mạng chập chờn — dừng theo dõi, tin vẫn đang gửi */ }
+            };
+            void poll();
+        } catch (err) {
+            showToast(`❌ Lỗi kết nối: ${err instanceof Error ? err.message : "không rõ"}`, 8000);
         } finally {
-            // Release ALL locks
-            (window as unknown as Record<string, boolean>).__broadcastSending = false;
-            setIsSending(false);
             sendingLockRef.current = false;
-            lastSentTimeRef.current = Date.now(); // Start 10s cooldown
-            // GIỮ batchProgress ở sent=total để thanh bar hiển thị 100% xanh lá
-            abortControllerRef.current = null;
-            setAutoBatchInfo(null);
-            setBatchCountdown(0);
+            setIsSending(false);
+            lastSentTimeRef.current = Date.now();
         }
     };
 
@@ -1286,17 +1184,33 @@ export default function BroadcastTab() {
                     </span>
                 </div>
 
-                {/* 4 Message Boxes */}
+                {/* Lưới 12 ô: 3 cụm × 4 khung giờ */}
                 <div className="space-y-4">
-                    {[
-                        { idx: 0, label: 'ĐOẠN 1 – Nhắc lại thành phần', color: 'emerald', hour: '6:00', placeholder: 'VD: 🌿 Sản phẩm chứa Niacinamide, Vitamin C...' },
-                        { idx: 1, label: 'ĐOẠN 2 – Nhắc lại feedback KH', color: 'blue', hour: '11:00', placeholder: 'VD: ⭐ Chị Hoa thấy da sáng hẳn sau 2 tuần...' },
-                        { idx: 2, label: 'ĐOẠN 3 – Kêu gọi mua hàng', color: 'violet', hour: '17:00', placeholder: 'VD: 🔥 FLASH SALE giảm 50%! Inbox ngay...' },
-                        { idx: 3, label: 'ĐOẠN 4 – Nội dung khác', color: 'rose', hour: '21:00', placeholder: 'VD: 🌙 Cảm ơn quý khách đã ủng hộ...' },
-                    ].map(({ idx, label, color, hour, placeholder }) => {
+                    {Array.from({ length: SLOT_COUNT }, (_, idx) => {
+                        const cum = Math.floor(idx / SLOT_HOURS.length);
+                        const slot = idx % SLOT_HOURS.length;
+                        const color = (['emerald', 'blue', 'violet', 'rose'] as const)[slot];
+                        const hour = `${SLOT_HOURS[slot]}:00`;
+                        const label = `TIN ${idx + 1} · ${CUM_LABELS[cum]}`;
+                        const placeholder = [
+                            'Chào + trả lời ngay câu khách hay hỏi nhất…',
+                            'Báo giá, phí ship, hình thức thanh toán…',
+                            'Công dụng chính, nối tiếp lời hứa của quảng cáo…',
+                            'Cách dùng / cách đặt hàng…',
+                            'Ảnh hoặc lời khách đã mua…',
+                            'Gỡ băn khoăn phổ biến nhất…',
+                            'Gỡ băn khoăn thứ hai…',
+                            'Cam kết: kiểm hàng trước khi trả tiền…',
+                            'Ưu đãi có hạn…',
+                            'Khan hàng, giữ chỗ…',
+                            'Hỏi thẳng để lấy tên + SĐT + địa chỉ…',
+                            'Tin cuối, để ngỏ cửa quay lại…',
+                        ][idx] ?? '';
+                        return { idx, label, color, hour, placeholder };
+                    }).map(({ idx, label, color, hour, placeholder }) => {
                         const boxMedia = mediaArrays[idx];
                         const boxMsg = messages[idx];
-                        const setMsg = setMessages[idx];
+                        const setMsg = (v: string) => setMessageAt(idx, v);
                         const colorMap: Record<string, Record<string, string>> = {
                             emerald: { border: 'border-emerald-100', bg: 'bg-emerald-50/20', badge: 'bg-emerald-500', text: 'text-emerald-600', mediaBorder: 'border-emerald-200', inputBorder: 'border-emerald-100', ring: 'focus:ring-emerald-300/30', uploadBorder: 'border-emerald-200 hover:border-emerald-400', uploadBg: 'hover:bg-emerald-50', uploadText: 'text-emerald-400' },
                             blue: { border: 'border-blue-100', bg: 'bg-blue-50/20', badge: 'bg-blue-500', text: 'text-blue-600', mediaBorder: 'border-blue-200', inputBorder: 'border-blue-100', ring: 'focus:ring-blue-300/30', uploadBorder: 'border-blue-200 hover:border-blue-400', uploadBg: 'hover:bg-blue-50', uploadText: 'text-blue-400' },
@@ -1339,7 +1253,10 @@ export default function BroadcastTab() {
                                     <textarea
                                         value={boxMsg}
                                         onChange={(e) => setMsg(e.target.value)}
-                                        placeholder={placeholder}
+                                        onPaste={handlePaste(idx)}
+                                        onDrop={handleDrop(idx)}
+                                        onDragOver={(e) => e.preventDefault()}
+                                        placeholder={uploadingBox === idx ? "Đang tải ảnh lên…" : placeholder}
                                         rows={5}
                                         className={`flex-1 min-w-0 rounded-lg border ${c.inputBorder} bg-white px-3 py-2 text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:ring-2 ${c.ring} resize-none`}
                                     />

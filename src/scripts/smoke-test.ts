@@ -87,11 +87,11 @@ try {
     // ═══ 1. MIGRATION ═══════════════════════════════════════════════════════
     section("Migration");
     const applied = await migrate();
-    eq("Áp dụng đúng 3 file migration", applied, 3);
+    eq("Áp dụng đúng 4 file migration", applied, 4);
     const tables = await query<{ n: number }>(
         `SELECT COUNT(*)::int AS n FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
     );
-    eq("Tạo đủ 12 bảng (11 nghiệp vụ + schema_migrations)", tables[0]?.n, 12);
+    eq("Tạo đủ 13 bảng (12 nghiệp vụ + schema_migrations)", tables[0]?.n, 13);
     eq("Chạy migrate lần 2 không áp dụng lại", await migrate(), 0);
 
     // ═══ 2. PAGE ════════════════════════════════════════════════════════════
@@ -900,6 +900,79 @@ try {
 
     await new Promise<void>((r) => web3.close(() => r()));
     await query(`DELETE FROM pages WHERE page_id = 'SMOKE_SOAN'`);
+
+    // ═══ 20. BẮN TAY TỪ GIAO DIỆN ═══════════════════════════════════════════
+    section("Bắn tay từ giao diện");
+    eq("Migration 004 đã chạy",
+        (await queryOne<{ n: number }>(`SELECT COUNT(*)::int AS n FROM schema_migrations WHERE name = '004_bantay_va_anh.sql'`))?.n, 1);
+
+    const mPage = await pagesRepo.upsert({ pageId: "SMOKE_MANUAL", pageName: "Page bắn tay", market: "Test", utcOffset });
+    await pagesRepo.setActive(mPage.id, true, 100);
+    await scriptsRepo.replaceActiveScript(mPage.id, "KB bắn tay", messages, { journeyDays: 7, slotsPerDay: 4 });
+    await customersRepo.upsertBatch(mPage.id, [mk("M1", 1), mk("M2", 1), mk("M3", 1)]);
+
+    const m1 = (await customersRepo.findByPsid(mPage.id, "M1"))!;
+    const m2 = (await customersRepo.findByPsid(mPage.id, "M2"))!;
+    const m3 = (await customersRepo.findByPsid(mPage.id, "M3"))!;
+
+    // Khách đã chốt đơn thì KHÔNG được gửi, dù người dùng có tích chọn
+    await customersRepo.stop(m3.id, "converted", "đã mua");
+
+    const n1 = await queueRepo.enqueueManual({
+        pageDbId: mPage.id, customerIds: [m1.id, m2.id, m3.id],
+        body: "Tin bắn tay", media: ["https://x/a.jpg"],
+    });
+    eq("⭐ Bỏ qua khách đã chốt đơn dù được tích chọn", n1, 2);
+
+    const mq = await query<{ manual: boolean; override_body: string; script_message_id: number | null; media_len: number }>(
+        `SELECT manual, override_body, script_message_id,
+                COALESCE(array_length(override_media, 1), 0) AS media_len
+           FROM send_queue WHERE page_id = $1 AND manual`, [mPage.id]);
+    eq("Ghi đúng 2 lượt bắn tay", mq.length, 2);
+    check("Lượt bắn tay mang nội dung riêng, không trỏ kịch bản",
+        mq.every((r) => r.manual && r.override_body === "Tin bắn tay" && r.script_message_id === null && r.media_len === 1));
+
+    // ⭐ Bắn tay được phép gửi LẠI cùng khách; lượt theo lịch thì không
+    const n2 = await queueRepo.enqueueManual({
+        pageDbId: mPage.id, customerIds: [m1.id], body: "Tin bắn tay lần 2", media: [],
+    });
+    eq("⭐ Bắn tay lần 2 cho cùng khách vẫn được (người dùng chủ động)", n2, 1);
+
+    // Page vừa bật chạy chế độ khởi động dần (25% tệp trong 3 ngày đầu), mà 25%
+    // của 2 khách làm tròn xuống = 0. Lùi ngày bật lại để page chạy hết công suất.
+    await query(`UPDATE pages SET activated_at = now() - interval '10 days' WHERE id = $1`, [mPage.id]);
+    const planFirst = await planPage((await pagesRepo.findById(mPage.id))!, log);
+    check("Xếp được lượt theo lịch cho 2 khách còn active", planFirst.enqueued > 0,
+        `eligible=${planFirst.eligible} enqueued=${planFirst.enqueued}`);
+    const planAgain = await planPage((await pagesRepo.findById(mPage.id))!, log);
+    eq("…nhưng lượt THEO LỊCH vẫn bị chặn trùng như cũ", planAgain.enqueued, 0);
+
+    // Engine lấy được lượt bắn tay kèm đúng nội dung riêng
+    await query(`UPDATE send_queue SET scheduled_at = now() - interval '1 minute' WHERE page_id = $1`, [mPage.id]);
+    const picked = await queueRepo.pickBatch(20, "w-manual", mPage.id);
+    const manualJobs = picked.filter((j) => j.manual);
+    check("⭐ Engine lấy được lượt bắn tay", manualJobs.length >= 2);
+    check("…và đọc đúng nội dung riêng, không phải nội dung kịch bản",
+        manualJobs.some((j) => j.body === "Tin bắn tay" && j.media.length === 1));
+    const theoLich = picked.filter((j) => !j.manual);
+    check("…lượt theo lịch vẫn lấy nội dung từ kịch bản",
+        theoLich.length > 0 && theoLich.every((j) => j.script_message_id !== null && j.body.length > 0),
+        `lấy ${picked.length} lượt, theo lịch ${theoLich.length}` +
+        (theoLich[0] ? ` · mẫu: msgId=${theoLich[0].script_message_id} body="${String(theoLich[0].body).slice(0, 24)}"` : ""));
+
+    // Bắn tay vào page đang NGƯNG thì engine không lấy
+    await pagesRepo.pause(mPage.id, 30, "thử #2022");
+    eq("⭐ Page đang ngưng → engine không lấy lượt bắn tay nào", (await queueRepo.pickBatch(20, "w-m2", mPage.id)).length, 0);
+    await pagesRepo.recover(mPage.id);
+
+    let rejectedEmptyManual = false;
+    try { await queueRepo.enqueueManual({ pageDbId: mPage.id, customerIds: [m1.id], body: "  ", media: [] }); }
+    catch { rejectedEmptyManual = true; }
+    check("Từ chối bắn tay khi không có chữ lẫn ảnh", rejectedEmptyManual);
+    eq("Danh sách khách rỗng → không ghi gì",
+        await queueRepo.enqueueManual({ pageDbId: mPage.id, customerIds: [], body: "x", media: [] }), 0);
+
+    await query(`DELETE FROM pages WHERE page_id = 'SMOKE_MANUAL'`);
 
     await closePool();
 } catch (err) {

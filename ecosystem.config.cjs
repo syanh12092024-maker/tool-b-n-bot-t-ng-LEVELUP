@@ -38,7 +38,7 @@ module.exports = {
             script: "dist/jobs/send.js",
             cwd,
             autorestart: false,
-            cron_restart: "*/5 * * * *",
+            cron_restart: "* * * * *",
             env: { NODE_ENV: "production" },
         },
         {
