@@ -1,23 +1,26 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { Be_Vietnam_Pro } from "next/font/google";
 import "@/styles/globals.css";
-import { cn } from "@/lib/utils";
 
-const inter = Inter({ subsets: ["latin"] });
+// Be Vietnam Pro được thiết kế riêng cho tiếng Việt — dấu không bị chồng hay
+// lệch như các phông Latin phổ thông. Giao diện này toàn tiếng Việt nên đây là
+// lựa chọn đúng, không phải Inter.
+const font = Be_Vietnam_Pro({
+    subsets: ["latin", "vietnamese"],
+    weight: ["400", "500", "600", "700"],
+    display: "swap",
+});
 
 export const metadata: Metadata = {
-    title: "Gửi tin hàng loạt",
-    description: "Gửi tin hàng loạt — TALPHA Standalone Module",
+    title: "Bắn bot TALPHA",
+    description: "Công cụ vận hành chiến dịch nhắn tin Messenger",
+    robots: { index: false, follow: false },
 };
 
-export default function RootLayout({
-    children,
-}: Readonly<{
-    children: React.ReactNode;
-}>) {
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
     return (
-        <html lang="en" suppressHydrationWarning>
-            <body className={cn(inter.className, "bg-background text-foreground antialiased")} suppressHydrationWarning>
+        <html lang="vi" suppressHydrationWarning>
+            <body className={font.className} suppressHydrationWarning>
                 {children}
             </body>
         </html>

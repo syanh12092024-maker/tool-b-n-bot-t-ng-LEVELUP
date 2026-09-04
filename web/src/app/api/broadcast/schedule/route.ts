@@ -16,6 +16,9 @@ export const dynamic = "force-dynamic";
 
 const SLOT_HOURS = (process.env.SEND_SLOT_HOURS || "6,11,17,21")
     .split(",").map((s) => Number(s.trim())).filter((n) => Number.isInteger(n));
+const SLOT_COUNT = SLOT_HOURS.length * 3; // 3 cụm × 4 khung giờ = 12 tin
+
+interface Seg { segIdx: number; message?: string; media?: string[]; label?: string }
 
 interface Row {
     page_id: number;
@@ -137,6 +140,66 @@ export async function POST(req: NextRequest) {
                 [page.id, turningOn]
             );
             return NextResponse.json({ ok: true, isActive: turningOn });
+        }
+
+        // Lưu 12 tin của kịch bản.
+        //
+        // GIỮ NGUYÊN id của từng tin khi có thể: send_log trỏ theo id, tạo bản
+        // ghi mới sẽ làm báo cáo "tin nào ra đơn" mất sạch lịch sử của tin cũ.
+        if (action === "save") {
+            const sched = (body as { schedule?: { pageId?: string; segments?: Seg[] } }).schedule;
+            const fbPageId = String(sched?.pageId ?? "");
+            const segs = sched?.segments ?? [];
+            if (!fbPageId) return NextResponse.json({ error: "Thiếu page" }, { status: 400 });
+
+            const page = await queryOne<{ id: number; page_name: string }>(
+                `SELECT id, page_name FROM pages WHERE page_id = $1`, [fbPageId]);
+            if (!page) return NextResponse.json({ error: "Page chưa có trong hệ thống" }, { status: 404 });
+
+            const filled = segs.filter((x) => (x.message ?? "").trim() || (x.media ?? []).length);
+            if (filled.length === 0) {
+                return NextResponse.json({ error: "Chưa nhập nội dung nào" }, { status: 400 });
+            }
+
+            const script = await queryOne<{ id: number }>(
+                `SELECT id FROM scripts WHERE page_id = $1 AND is_active`, [page.id]);
+
+            let scriptId = script?.id;
+            if (!scriptId) {
+                const created = await queryOne<{ id: number }>(
+                    `INSERT INTO scripts (page_id, name, journey_days, slots_per_day, message_count, is_active)
+                     VALUES ($1, $2, 7, $3, $4, TRUE) RETURNING id`,
+                    [page.id, `${page.page_name} — ${new Date().toISOString().slice(0, 10)}`,
+                     SLOT_HOURS.length, SLOT_COUNT]);
+                scriptId = created!.id;
+            }
+
+            for (let i = 0; i < SLOT_COUNT; i++) {
+                const seg = segs.find((x) => x.segIdx === i);
+                const bodyText = (seg?.message ?? "").trim();
+                const media = (seg?.media ?? []).filter((u) => String(u).trim());
+                // Ràng buộc CHECK ở DB không cho tin rỗng; ô chưa nhập giữ dấu gạch
+                const safeBody = bodyText || (media.length ? "" : "—");
+                await query(
+                    `INSERT INTO script_messages (script_id, order_index, label, body, media)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (script_id, order_index) DO UPDATE
+                        SET body = EXCLUDED.body, media = EXCLUDED.media,
+                            label = COALESCE(NULLIF(EXCLUDED.label, ''), script_messages.label)`,
+                    [scriptId, i, seg?.label ?? null, safeBody, media]
+                );
+            }
+
+            const done = filled.length;
+            return NextResponse.json({
+                ok: true,
+                scriptId,
+                filled: done,
+                total: SLOT_COUNT,
+                message: done === SLOT_COUNT
+                    ? `Đã lưu đủ ${SLOT_COUNT} tin`
+                    : `Đã lưu ${done}/${SLOT_COUNT} tin — còn ${SLOT_COUNT - done} ô chưa nhập`,
+            });
         }
 
         return NextResponse.json({ error: `Chưa hỗ trợ thao tác: ${action}` }, { status: 400 });

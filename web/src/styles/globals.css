@@ -2,110 +2,283 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   Hệ màu cho công cụ VẬN HÀNH.
+
+   Nguyên tắc: màu phải MANG THÔNG TIN, không để trang trí.
+   - Một màu thương hiệu duy nhất (xanh dầu) cho hành động chính và điều hướng.
+   - Ba màu ngữ nghĩa: chạy / cảnh báo / hỏng. Không dùng chúng vào việc khác.
+   - Bốn màu khung giờ (bình minh → đêm) để nhìn phát biết tin ra lúc nào.
+
+   Bảng cũ dùng cam-đỏ gradient và hiệu ứng kính: hợp trang tiếp thị, không hợp
+   màn hình mà người ta nhìn cả ngày để quyết định có gửi tin cho khách thật hay
+   không.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
 @layer base {
   :root {
-    /* ═══ LEVEL UP Light Theme ═══ */
-    /* Brand: Orange (#F5A623) → Red (#E74C3C) gradient */
-    --background: 0 0% 97%;
-    /* #f7f7f7 warm white */
-    --foreground: 220 15% 20%;
-    /* #2d3748 dark slate */
-    --card: 0 0% 100%;
-    /* #ffffff */
-    --card-foreground: 220 15% 20%;
-    /* #2d3748 */
-    --popover: 0 0% 100%;
-    --popover-foreground: 220 15% 30%;
-    --primary: 28 90% 55%;
-    /* #F5A623 — brand orange */
-    --primary-foreground: 0 0% 100%;
-    /* white on orange */
-    --secondary: 35 100% 96%;
-    /* #FFF8E8 light amber bg */
-    --secondary-foreground: 28 80% 35%;
-    --muted: 220 14% 94%;
-    /* #EDF2F7 light gray */
-    --muted-foreground: 220 10% 46%;
-    /* #6B7280 */
-    --accent: 28 90% 95%;
-    /* #FFF3E0 light orange */
-    --accent-foreground: 28 80% 30%;
-    --destructive: 0 72% 51%;
-    /* #EF4444 */
-    --destructive-foreground: 0 0% 100%;
-    --border: 220 13% 90%;
-    /* #E2E8F0 */
-    --input: 220 13% 90%;
-    --ring: 28 90% 55%;
-    /* brand orange ring */
-    --radius: 0.75rem;
+    --paper: #eef1f5;
+    --card: #ffffff;
+    --card-2: #f6f8fa;
+    --ink: #141922;
+    --ink-2: #4a5468;
+    --ink-3: #7b859a;
+    --line: #dce1e9;
+    --line-soft: #e9edf3;
 
-    /* ─── Brand palette tokens ─── */
-    --brand-orange: 28 90% 55%;
-    --brand-red: 6 78% 57%;
-    --brand-gradient: linear-gradient(135deg, hsl(28, 90%, 55%), hsl(6, 78%, 57%));
+    --brand: #0d5c68;
+    --brand-hover: #0a4a54;
+    --brand-soft: #dcedf0;
+    --brand-ink: #ffffff;
 
-    /* ─── UI Enhancement Tokens ─── */
-    --glass-bg: 0 0% 100% / 0.7;
-    --glass-border: 0 0% 100% / 0.5;
-    --shadow-soft: 0 8px 30px rgba(0, 0, 0, 0.04);
+    --ok: #17734b;
+    --ok-soft: #dcefe4;
+    --warn: #9a6410;
+    --warn-soft: #f8ecd2;
+    --bad: #a63a2c;
+    --bad-soft: #f8e0dc;
+
+    /* Bốn khung giờ trong ngày — dùng nhất quán ở mọi nơi nhắc tới giờ gửi */
+    --dawn: #bd6249;
+    --noon: #b3860a;
+    --dusk: #7c519b;
+    --night: #3b559c;
+
+    --shadow-sm: 0 1px 2px rgba(20, 25, 34, 0.05);
+    --shadow: 0 1px 2px rgba(20, 25, 34, 0.05), 0 8px 24px -16px rgba(20, 25, 34, 0.3);
+    --radius: 10px;
+
+    /* Giữ các token Tailwind cũ để lớp shadcn không gãy */
+    --background: 214 27% 95%;
+    --foreground: 220 24% 11%;
+    --border: 216 22% 89%;
+    --input: 216 22% 89%;
+    --ring: 189 77% 23%;
+    --radius-tw: 0.625rem;
   }
-}
 
-@layer base {
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #0e1116;
+      --card: #161b23;
+      --card-2: #1b212b;
+      --ink: #e7eaf0;
+      --ink-2: #a5aec1;
+      --ink-3: #79839a;
+      --line: #29313e;
+      --line-soft: #212832;
+
+      --brand: #56ccd9;
+      --brand-hover: #7bdce6;
+      --brand-soft: #10333a;
+      --brand-ink: #08222a;
+
+      --ok: #55c592;
+      --ok-soft: #12301f;
+      --warn: #e0ab4d;
+      --warn-soft: #33280f;
+      --bad: #f08471;
+      --bad-soft: #351812;
+
+      --dawn: #e0917a;
+      --noon: #e0b04a;
+      --dusk: #b98fd4;
+      --night: #7f9ae0;
+
+      --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px -18px rgba(0, 0, 0, 0.8);
+
+      --background: 217 22% 7%;
+      --foreground: 220 25% 92%;
+      --border: 218 21% 20%;
+      --input: 218 21% 20%;
+    }
+  }
+
   * {
-    @apply border-border;
+    box-sizing: border-box;
   }
 
   body {
-    @apply bg-background text-foreground;
-    font-feature-settings: "rlig" 1, "calt" 1;
+    background: var(--paper);
+    color: var(--ink);
+    font-feature-settings: "cv02", "cv03", "cv04";
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Bàn phím phải thấy được mình đang ở đâu */
+  :focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
   }
 }
 
-/* ═══ Component overrides for Bright Premium UI ═══ */
-
-.kpi-card {
-  @apply rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm transition-all duration-300 hover:shadow-lg hover:shadow-slate-200/30 hover:-translate-y-0.5;
-}
-
-.glass-panel {
-  @apply rounded-2xl border border-slate-200/80 bg-white shadow-sm;
-}
-
-.section-header {
-  @apply mb-4 flex items-center gap-2 text-lg font-bold text-slate-800 tracking-tight;
-}
-
-/* Brand gradient text */
-.brand-gradient-text {
-  background: var(--brand-gradient);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-/* Glow effects for light theme */
-.glow-primary {
-  box-shadow: 0 0 20px hsla(28, 90%, 55%, 0.15);
-}
-
-.glow-emerald {
-  box-shadow: 0 0 20px hsla(142, 71%, 45%, 0.15);
-}
-
-.animate-in {
-  animation: fade-in 0.5s ease-out;
-}
-
-@keyframes fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
+@layer components {
+  /* ─── Khối ─────────────────────────────────────────────────────────── */
+  .surface {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-sm);
   }
 
-  to {
-    opacity: 1;
-    transform: translateY(0);
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+
+  /* ─── Nút ──────────────────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    border-radius: 8px;
+    padding: 8px 15px;
+    font-size: 13.5px;
+    font-weight: 600;
+    line-height: 1.2;
+    border: 1px solid transparent;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 0.12s, border-color 0.12s, opacity 0.12s;
+  }
+  .btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background: var(--brand);
+    color: var(--brand-ink);
+  }
+  .btn-primary:not(:disabled):hover {
+    background: var(--brand-hover);
+  }
+
+  .btn-ghost {
+    background: transparent;
+    color: var(--ink-2);
+    border-color: var(--line);
+  }
+  .btn-ghost:not(:disabled):hover {
+    background: var(--card-2);
+    color: var(--ink);
+  }
+
+  .btn-danger {
+    background: var(--bad-soft);
+    color: var(--bad);
+    border-color: transparent;
+  }
+
+  .btn-sm {
+    padding: 5px 11px;
+    font-size: 12.5px;
+    border-radius: 7px;
+  }
+
+  /* ─── Nhập liệu ────────────────────────────────────────────────────── */
+  .field {
+    width: 100%;
+    background: var(--card-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 9px 12px;
+    font: inherit;
+    font-size: 14px;
+    color: var(--ink);
+    transition: border-color 0.12s;
+  }
+  .field::placeholder {
+    color: var(--ink-3);
+  }
+  .field:focus {
+    outline: none;
+    border-color: var(--brand);
+  }
+
+  /* ─── Nhãn trạng thái ──────────────────────────────────────────────── */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    line-height: 1.6;
+  }
+  .chip-ok {
+    background: var(--ok-soft);
+    color: var(--ok);
+  }
+  .chip-warn {
+    background: var(--warn-soft);
+    color: var(--warn);
+  }
+  .chip-bad {
+    background: var(--bad-soft);
+    color: var(--bad);
+  }
+  .chip-brand {
+    background: var(--brand-soft);
+    color: var(--brand);
+  }
+  .chip-muted {
+    background: var(--card-2);
+    color: var(--ink-3);
+    border: 1px solid var(--line);
+  }
+
+  /* ─── Bảng ─────────────────────────────────────────────────────────── */
+  .tbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  .tbl th {
+    text-align: left;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--ink-3);
+    background: var(--card-2);
+    padding: 9px 14px;
+    white-space: nowrap;
+    border-bottom: 1px solid var(--line);
+  }
+  .tbl td {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line-soft);
+    vertical-align: middle;
+  }
+  .tbl tbody tr:last-child td {
+    border-bottom: none;
+  }
+  .tbl tbody tr:hover {
+    background: var(--card-2);
+  }
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
   }
 }

@@ -1,1804 +1,1262 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import {
-    Send, Users, RefreshCw, CheckCircle2, XCircle, Loader2,
-    ChevronDown, Search, CheckSquare, Square, MessageSquare,
-    AlertTriangle, ShoppingBag, Phone, ExternalLink, ImagePlus, X,
-    Clock, Timer, CalendarClock, Filter, Pencil, Zap
-} from "lucide-react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 
-// ─── Timezone mapping ─────────────────────────────────────────────────────────
-const SHOP_TIMEZONES: Record<string, { offset: number; label: string; flag: string }> = {
-    "Saudi": { offset: 3, label: "Riyadh", flag: "🇸🇦" },
-    "UAE": { offset: 4, label: "Dubai", flag: "🇦🇪" },
-    "Kuwait": { offset: 3, label: "Kuwait City", flag: "🇰🇼" },
-    "Oman": { offset: 4, label: "Muscat", flag: "🇴🇲" },
-    "Qatar": { offset: 3, label: "Doha", flag: "🇶🇦" },
-    "Bahrain": { offset: 3, label: "Manama", flag: "🇧🇭" },
-    "Japan": { offset: 9, label: "Tokyo", flag: "🇯🇵" },
-    "Taiwan": { offset: 8, label: "Taipei", flag: "🇹🇼" },
-};
+/**
+ * Giao diện vận hành bắn bot.
+ *
+ * Chia làm BA màn hình theo ba việc khác nhau, thay vì dồn tất cả vào một trang
+ * cuộn dài như bản trước:
+ *
+ *   Tổng quan  — page nào đang chạy, còn bao nhiêu khách, đã có kịch bản chưa
+ *   Kịch bản   — soạn 12 tin của chuỗi nuôi dưỡng, bày thành lưới 3 cụm × 4 khung giờ
+ *   Bắn tay    — chọn khách trong bảng rồi gửi ngay một tin
+ *
+ * Trước đây hai việc "soạn kịch bản tự động" và "bắn tay cho khách đã chọn"
+ * dùng chung một bộ ô soạn, dễ nhầm: sửa nội dung định để bắn tay lại hoá ra
+ * đang sửa kịch bản đang chạy.
+ */
 
-// Cửa sổ gửi được: HUMAN_AGENT tag = 7 ngày kể từ tương tác cuối của khách
-const SEND_WINDOW_MS = 7 * 86400000;
-
-// Lưới soạn nội dung: 3 cụm × 4 khung giờ = 12 tin, khớp với chuỗi nuôi dưỡng
-// của engine (công thức ((ngày-1)*4 + khung) mod 12).
+// ─── Hằng số khung giờ ────────────────────────────────────────────────────────
 const SLOT_HOURS = [6, 11, 17, 21];
-const CUM_LABELS = ["A · giới thiệu", "B · bằng chứng", "C · thúc chốt"];
-const SLOT_COUNT = SLOT_HOURS.length * CUM_LABELS.length;
-const SCHEDULE_LABELS: Record<number, string> = {
-    6: "🌅 Sáng sớm",
-    11: "☀️ Trưa",
-    17: "🌆 Chiều",
-    21: "🌙 Tối",
-};
+const CUM = [
+    { key: "A", name: "Giới thiệu", hint: "Chào hỏi, báo giá, công dụng, cách đặt" },
+    { key: "B", name: "Bằng chứng", hint: "Feedback khách, cam kết, gỡ băn khoăn" },
+    { key: "C", name: "Thúc chốt", hint: "Ưu đãi, khan hàng, xin thông tin" },
+];
+const SLOT_COUNT = SLOT_HOURS.length * CUM.length;
 
-function getNextScheduleTime(hour: number, utcOffset: number): Date {
-    const now = new Date();
-    // Current time in target timezone
-    const targetNow = new Date(now.getTime() + utcOffset * 3600000 + now.getTimezoneOffset() * 60000);
-    // Target time today in target timezone
-    const target = new Date(targetNow);
-    target.setHours(hour, 0, 0, 0);
-    // If time already passed today, schedule for tomorrow
-    if (target <= targetNow) {
-        target.setDate(target.getDate() + 1);
-    }
-    // Convert back to local time
-    const diff = target.getTime() - targetNow.getTime();
-    return new Date(now.getTime() + diff);
-}
+const DAYPART = [
+    { label: "Sáng", color: "var(--dawn)" },
+    { label: "Trưa", color: "var(--noon)" },
+    { label: "Chiều", color: "var(--dusk)" },
+    { label: "Tối", color: "var(--night)" },
+];
 
-function formatCountdown(ms: number): string {
-    if (ms <= 0) return "00:00:00";
-    const h = Math.floor(ms / 3600000);
-    const m = Math.floor((ms % 3600000) / 60000);
-    const s = Math.floor((ms % 60000) / 1000);
-    return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
-}
+const GOI_Y = [
+    "Chào + trả lời ngay câu khách hay hỏi nhất",
+    "Báo giá, phí ship, hình thức thanh toán",
+    "Công dụng chính, nối tiếp lời hứa của quảng cáo",
+    "Cách dùng / cách đặt hàng",
+    "Ảnh hoặc lời của khách đã mua",
+    "Gỡ băn khoăn phổ biến nhất",
+    "Gỡ băn khoăn thứ hai",
+    "Cam kết: kiểm hàng trước khi trả tiền",
+    "Ưu đãi có hạn",
+    "Khan hàng, giữ chỗ",
+    "Hỏi thẳng để lấy tên + SĐT + địa chỉ",
+    "Tin cuối, để ngỏ cửa quay lại",
+];
 
-function getCurrentTimeInTimezone(utcOffset: number): string {
-    const now = new Date();
-    const target = new Date(now.getTime() + utcOffset * 3600000 + now.getTimezoneOffset() * 60000);
-    return target.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
-}
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-interface Shop {
-    name: string;
-    shop_id: string;
-}
-
+// ─── Kiểu dữ liệu ─────────────────────────────────────────────────────────────
 interface PageInfo {
     pageId: string;
     name: string;
-    platform: string;
-    source?: string;
-    shopName?: string;
+    shopName: string;
+    isActive: boolean;
+    health: string;
+    rampPercent: number;
+    hasScript: boolean;
+    activeCustomers: number;
+    totalCustomers: number;
+    lastSyncedAt: string | null;
 }
 
 interface Customer {
     id: string;
     customerName: string;
     customerPhone: string;
-    fbId: string;
     psid: string;
-    pageFbId: string;
-    customerId: string;
-    conversationLink: string;
-    orderCount: number;
-    messageCount: number;
-    snippet: string;
-    tags: string[] | number[];
-    address: string;
-    updatedAt: string;
+    tags: string[];
     lastInteraction: string;
-    source: "crm" | "pos";
+    status: string;
+    journeyDay: number;
+    orderCount: number;
 }
 
-interface SendResult {
-    psid: string;
-    name: string;
-    success: boolean;
-    error?: string;
-    via?: 'pancake' | 'fb_graph_api';
-}
-
-// ─── Schedule types (synced with BigQuery via API) ───────────────────────────
-type SegmentStatus = 'pending' | 'sending' | 'sent' | 'error';
-
-interface ScheduleSegment {
-    segIdx: number;   // 0-3
-    hour: number;     // 6, 11, 17, 21
+interface Segment {
+    segIdx: number;
+    hour: number;
+    label: string;
     message: string;
-    media?: string[];
-    status?: SegmentStatus;
-    error?: string;
-    sentAt?: string;
-    totalRecipients?: number;
-    successCount?: number;
-    errorCount?: number;
+    media: string[];
+    successCount: number;
+    errorCount: number;
 }
 
-interface BroadcastSchedule {
-    id: string;
-    shopId: string;
-    shopName: string;
+interface Schedule {
     pageId: string;
     pageName: string;
-    hour: number;
-    messages: string[];
-    segments?: ScheduleSegment[];
-    filterPurchase: string;
-    filterTimeRange: string;
+    segments: Segment[];
     isActive: boolean;
-    createdAt: string;
-    lastFiredAt: string | null;
-    nextFireAt: string | null;
-    note?: string;
-    lastSegmentIndex?: number;
-    lastRunDate?: string;
-    firedDates?: string[];
-    recipientCount?: number;
+    recipientCount: number;
+    hasScript: boolean;
+    health: string;
 }
 
-// ─── Auth helper: server bật APP_ACCESS_KEY thì mọi request phải kèm key ─────
-const APP_KEY_STORAGE = "broadcast_app_key";
+type Screen = "tong-quan" | "kich-ban" | "ban-tay";
 
-// Magic link: mở trang dạng /?key=XXX → tự lưu key vào trình duyệt rồi xoá khỏi
-// thanh địa chỉ. User chỉ cần bookmark link có key, không bao giờ phải nhập tay.
-// (Chạy ở module-level để key được lưu TRƯỚC mọi lời gọi API đầu tiên)
+// ─── Gọi API ──────────────────────────────────────────────────────────────────
+const KEY_STORE = "banbot_key";
+
 if (typeof window !== "undefined") {
     try {
-        const url = new URL(window.location.href);
-        const urlKey = url.searchParams.get("key");
-        if (urlKey && urlKey.trim()) {
-            localStorage.setItem(APP_KEY_STORAGE, urlKey.trim());
-            url.searchParams.delete("key");
-            window.history.replaceState({}, "", url.toString());
+        const u = new URL(window.location.href);
+        const k = u.searchParams.get("key");
+        if (k?.trim()) {
+            localStorage.setItem(KEY_STORE, k.trim());
+            u.searchParams.delete("key");
+            window.history.replaceState({}, "", u.toString());
         }
-    } catch { /* ignore */ }
+    } catch {
+        /* bỏ qua */
+    }
 }
 
-function getAppKey(): string {
-    if (typeof window === "undefined") return "";
-    return localStorage.getItem(APP_KEY_STORAGE) || "";
-}
-// Single-flight prompt: nhiều request cùng nhận 401 (lúc mount bắn 3 request
-// song song) chỉ hiện MỘT hộp thoại nhập mã, không hỏi 3 lần liên tiếp
-let keyPromptPromise: Promise<string | null> | null = null;
-function promptForKey(): Promise<string | null> {
-    if (!keyPromptPromise) {
-        keyPromptPromise = Promise.resolve()
-            .then(() => {
-                // Request song song có thể đã lưu key xong trong lúc mình chờ
-                const existing = getAppKey();
-                if (existing) return existing;
-                const entered = window.prompt("🔒 Nhập mã truy cập tool (APP_ACCESS_KEY):");
-                if (entered && entered.trim()) {
-                    localStorage.setItem(APP_KEY_STORAGE, entered.trim());
-                    return entered.trim();
-                }
-                return null;
-            })
-            .finally(() => { keyPromptPromise = null; });
+async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
+    const key = typeof window !== "undefined" ? localStorage.getItem(KEY_STORE) ?? "" : "";
+    const headers = new Headers(init?.headers);
+    if (key) headers.set("x-app-key", key);
+    const res = await fetch(url, { ...init, headers });
+    // Máy chủ đặt mật khẩu ở tầng nginx nên bình thường không gặp 401 ở đây.
+    // Giữ nhánh này cho trường hợp chạy trực tiếp khi phát triển.
+    if (res.status === 401 && typeof window !== "undefined") {
+        const entered = window.prompt("Nhập mã truy cập:");
+        if (entered?.trim()) {
+            localStorage.setItem(KEY_STORE, entered.trim());
+            headers.set("x-app-key", entered.trim());
+            return fetch(url, { ...init, headers });
+        }
     }
-    return keyPromptPromise;
-}
-
-async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
-    const attempt = (key: string) => {
-        const headers = new Headers(init?.headers || {});
-        if (key) headers.set("x-app-key", key);
-        return fetch(input, { ...init, headers });
-    };
-    const usedKey = getAppKey();
-    let res = await attempt(usedKey);
-    if (res.status !== 401) return res;
-    // Key có thể vừa được request khác lưu → thử lại với key mới nhất trước khi hỏi
-    const latest = getAppKey();
-    if (latest && latest !== usedKey) {
-        res = await attempt(latest);
-        if (res.status !== 401) return res;
-    }
-    const entered = await promptForKey();
-    if (entered) return attempt(entered);
     return res;
 }
 
-// ─── API helpers (thay thế localStorage) ─────────────────────────────────────
-// Trả về null khi lỗi mạng/server để caller GIỮ danh sách cũ thay vì ghi đè bằng []
-async function fetchSchedulesFromAPI(): Promise<BroadcastSchedule[] | null> {
-    try {
-        const res = await apiFetch('/api/broadcast/schedule');
-        if (!res.ok) return null;
-        const data = await res.json();
-        return data.schedules || [];
-    } catch (err) {
-        console.error('[broadcast] fetchSchedules error:', err);
-        return null;
-    }
+// ─── Tiện ích ─────────────────────────────────────────────────────────────────
+function ago(iso: string): string {
+    if (!iso) return "—";
+    const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+    if (!Number.isFinite(s)) return "—";
+    if (s < 3600) return `${Math.max(1, Math.round(s / 60))} phút trước`;
+    if (s < 86400) return `${Math.round(s / 3600)} giờ trước`;
+    return `${Math.round(s / 86400)} ngày trước`;
 }
 
-async function saveScheduleToAPI(schedule: BroadcastSchedule): Promise<boolean> {
-    try {
-        const res = await apiFetch('/api/broadcast/schedule', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'save', schedule }),
-        });
-        return res.ok;
-    } catch { return false; }
+function num(n: number): string {
+    return n.toLocaleString("vi-VN");
 }
 
-async function deleteScheduleFromAPI(scheduleId: string): Promise<boolean> {
-    try {
-        const res = await apiFetch('/api/broadcast/schedule', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'delete', scheduleId }),
-        });
-        return res.ok;
-    } catch { return false; }
+// ─── Thành phần dùng chung ────────────────────────────────────────────────────
+
+function Chip({ kind, children }: { kind: "ok" | "warn" | "bad" | "brand" | "muted"; children: React.ReactNode }) {
+    return <span className={`chip chip-${kind}`}>{children}</span>;
 }
 
-async function toggleScheduleAPI(scheduleId: string): Promise<boolean> {
-    try {
-        const res = await apiFetch('/api/broadcast/schedule', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'toggle', scheduleId }),
-        });
-        return res.ok;
-    } catch { return false; }
+function PageStateChip({ p }: { p: { isActive: boolean; health: string } }) {
+    if (!p.isActive) return <Chip kind="muted">Đang tắt</Chip>;
+    if (p.health === "paused") return <Chip kind="bad">Tạm ngưng</Chip>;
+    if (p.health === "degraded") return <Chip kind="warn">Hãm tốc</Chip>;
+    return <Chip kind="ok">Đang chạy</Chip>;
 }
 
-async function saveNoteAPI(scheduleId: string, note: string): Promise<boolean> {
-    try {
-        const res = await apiFetch('/api/broadcast/schedule', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'save_note', scheduleId, note }),
-        });
-        return res.ok;
-    } catch { return false; }
+function Stat({ value, label, hint, tone }: { value: string; label: string; hint?: string; tone?: string }) {
+    return (
+        <div className="surface px-4 py-3">
+            <div className="num text-[26px] font-bold leading-tight" style={tone ? { color: tone } : undefined}>
+                {value}
+            </div>
+            <div className="mt-0.5 text-[13px]" style={{ color: "var(--ink-2)" }}>
+                {label}
+            </div>
+            {hint && (
+                <div className="mt-0.5 text-[12px]" style={{ color: "var(--ink-3)" }}>
+                    {hint}
+                </div>
+            )}
+        </div>
+    );
 }
 
-function calcNextFireAt(hour: number, utcOffset: number): string {
-    return getNextScheduleTime(hour, utcOffset).toISOString();
+function Empty({ title, hint, action }: { title: string; hint?: string; action?: React.ReactNode }) {
+    return (
+        <div className="flex flex-col items-center justify-center px-6 py-16 text-center">
+            <div className="text-[15px] font-semibold">{title}</div>
+            {hint && (
+                <div className="mt-1.5 max-w-md text-[13.5px]" style={{ color: "var(--ink-3)" }}>
+                    {hint}
+                </div>
+            )}
+            {action && <div className="mt-4">{action}</div>}
+        </div>
+    );
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
-export default function BroadcastTab() {
-    const [shops, setShops] = useState<Shop[]>([]);
-    const [selectedShopId, setSelectedShopId] = useState("");
+// ═══ MÀN HÌNH 1 · TỔNG QUAN ═══════════════════════════════════════════════════
+
+function OverviewScreen({
+    pages,
+    loading,
+    onPick,
+}: {
+    pages: PageInfo[];
+    loading: boolean;
+    onPick: (pageId: string, screen: Screen) => void;
+}) {
+    const totals = useMemo(
+        () => ({
+            active: pages.filter((p) => p.isActive).length,
+            customers: pages.reduce((a, p) => a + p.activeCustomers, 0),
+            noScript: pages.filter((p) => !p.hasScript).length,
+            paused: pages.filter((p) => p.isActive && p.health === "paused").length,
+        }),
+        [pages]
+    );
+
+    return (
+        <div className="space-y-5">
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                <Stat value={num(totals.active)} label="Page đang chạy" hint={`trên tổng ${pages.length} page`} />
+                <Stat
+                    value={num(totals.customers)}
+                    label="Khách gửi được"
+                    hint="còn trong cửa sổ 7 ngày"
+                    tone="var(--brand)"
+                />
+                <Stat
+                    value={num(totals.noScript)}
+                    label="Page chưa có kịch bản"
+                    hint={totals.noScript ? "chưa gửi được gì" : "đủ cả"}
+                    tone={totals.noScript ? "var(--warn)" : undefined}
+                />
+                <Stat
+                    value={num(totals.paused)}
+                    label="Page bị tạm ngưng"
+                    hint={totals.paused ? "Facebook đang siết" : "không có"}
+                    tone={totals.paused ? "var(--bad)" : undefined}
+                />
+            </div>
+
+            <div className="panel overflow-hidden">
+                <div className="flex items-center justify-between border-b px-5 py-3.5" style={{ borderColor: "var(--line)" }}>
+                    <h2 className="text-[15px] font-bold">Các page</h2>
+                    <span className="text-[12.5px]" style={{ color: "var(--ink-3)" }}>
+                        Bấm vào một page để soạn kịch bản hoặc bắn tay
+                    </span>
+                </div>
+
+                {loading ? (
+                    <Empty title="Đang tải danh sách page…" />
+                ) : pages.length === 0 ? (
+                    <Empty
+                        title="Chưa có page nào"
+                        hint="Thêm page bằng dòng lệnh trên máy chủ: npm run page:add -- --page <id> --market Saudi"
+                    />
+                ) : (
+                    <div className="overflow-x-auto">
+                        <table className="tbl min-w-[860px]">
+                            <thead>
+                                <tr>
+                                    <th>Page</th>
+                                    <th>Thị trường</th>
+                                    <th>Trạng thái</th>
+                                    <th className="text-right">Gửi được</th>
+                                    <th className="text-right">Tổng tệp</th>
+                                    <th>Kịch bản</th>
+                                    <th>Đồng bộ</th>
+                                    <th />
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {pages.map((p) => (
+                                    <tr key={p.pageId}>
+                                        <td>
+                                            <div className="font-semibold">{p.name}</div>
+                                            <div className="mono" style={{ color: "var(--ink-3)" }}>
+                                                {p.pageId}
+                                            </div>
+                                        </td>
+                                        <td style={{ color: "var(--ink-2)" }}>{p.shopName}</td>
+                                        <td>
+                                            <div className="flex flex-wrap items-center gap-1.5">
+                                                <PageStateChip p={p} />
+                                                {p.isActive && p.rampPercent < 100 && (
+                                                    <Chip kind="warn">khởi động {p.rampPercent}%</Chip>
+                                                )}
+                                            </div>
+                                        </td>
+                                        <td className="num text-right font-bold">{num(p.activeCustomers)}</td>
+                                        <td className="num text-right" style={{ color: "var(--ink-3)" }}>
+                                            {num(p.totalCustomers)}
+                                        </td>
+                                        <td>
+                                            {p.hasScript ? (
+                                                <Chip kind="ok">đã có</Chip>
+                                            ) : (
+                                                <Chip kind="warn">chưa có</Chip>
+                                            )}
+                                        </td>
+                                        <td style={{ color: "var(--ink-3)" }}>{ago(p.lastSyncedAt ?? "")}</td>
+                                        <td className="text-right">
+                                            <div className="flex justify-end gap-1.5">
+                                                <button
+                                                    className="btn btn-ghost btn-sm"
+                                                    onClick={() => onPick(p.pageId, "kich-ban")}
+                                                >
+                                                    Kịch bản
+                                                </button>
+                                                <button
+                                                    className="btn btn-ghost btn-sm"
+                                                    onClick={() => onPick(p.pageId, "ban-tay")}
+                                                >
+                                                    Bắn tay
+                                                </button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+// ═══ MÀN HÌNH 2 · KỊCH BẢN ════════════════════════════════════════════════════
+
+function SlotCard({
+    idx,
+    label,
+    body,
+    media,
+    uploading,
+    onLabel,
+    onBody,
+    onPaste,
+    onDrop,
+    onPickFile,
+    onRemoveMedia,
+}: {
+    idx: number;
+    label: string;
+    body: string;
+    media: string[];
+    uploading: boolean;
+    onLabel: (v: string) => void;
+    onBody: (v: string) => void;
+    onPaste: (e: React.ClipboardEvent) => void;
+    onDrop: (e: React.DragEvent) => void;
+    onPickFile: (e: React.ChangeEvent<HTMLInputElement>) => void;
+    onRemoveMedia: (i: number) => void;
+}) {
+    const slot = idx % SLOT_HOURS.length;
+    const dp = DAYPART[slot]!;
+    const empty = !body.trim() && media.length === 0;
+
+    return (
+        <div
+            className="surface flex flex-col p-3.5"
+            style={empty ? { borderColor: "var(--warn)" } : undefined}
+            onDrop={onDrop}
+            onDragOver={(e) => e.preventDefault()}
+        >
+            <div className="mb-2 flex items-center gap-2">
+                <span
+                    className="num flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[12px] font-bold text-white"
+                    style={{ background: dp.color }}
+                >
+                    {idx + 1}
+                </span>
+                <span className="text-[12px] font-semibold" style={{ color: dp.color }}>
+                    {SLOT_HOURS[slot]}h · {dp.label}
+                </span>
+                {empty && (
+                    <span className="ml-auto">
+                        <Chip kind="warn">trống</Chip>
+                    </span>
+                )}
+            </div>
+
+            <input
+                className="field mb-2 !px-2.5 !py-1.5 !text-[12.5px]"
+                value={label}
+                onChange={(e) => onLabel(e.target.value)}
+                placeholder="nhãn ghi nhớ"
+            />
+
+            <textarea
+                className="field flex-1 resize-y !text-[13.5px] leading-relaxed"
+                rows={5}
+                value={body}
+                onChange={(e) => onBody(e.target.value)}
+                onPaste={onPaste}
+                placeholder={uploading ? "Đang tải ảnh lên…" : GOI_Y[idx]}
+            />
+
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                {media.map((url, i) => (
+                    <span key={url + i} className="relative">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                            src={url}
+                            alt=""
+                            className="h-11 w-11 rounded-md border object-cover"
+                            style={{ borderColor: "var(--line)" }}
+                        />
+                        <button
+                            onClick={() => onRemoveMedia(i)}
+                            title="Bỏ ảnh này"
+                            className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full text-[10px] font-bold text-white"
+                            style={{ background: "var(--bad)" }}
+                        >
+                            ×
+                        </button>
+                    </span>
+                ))}
+                <label
+                    className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-md border border-dashed text-[17px]"
+                    style={{ borderColor: "var(--line)", color: "var(--ink-3)" }}
+                    title="Thêm ảnh — hoặc dán thẳng vào ô nội dung"
+                >
+                    +
+                    <input type="file" accept="image/*" multiple className="hidden" onChange={onPickFile} />
+                </label>
+            </div>
+        </div>
+    );
+}
+
+function ScriptScreen({
+    page,
+    schedule,
+    msgs,
+    medias,
+    labels,
+    uploadingSlot,
+    saving,
+    onLabel,
+    onBody,
+    onPaste,
+    onDrop,
+    onPickFile,
+    onRemoveMedia,
+    onSave,
+    onToggleActive,
+}: {
+    page: PageInfo;
+    schedule: Schedule | null;
+    msgs: string[];
+    medias: string[][];
+    labels: string[];
+    uploadingSlot: number | null;
+    saving: boolean;
+    onLabel: (i: number, v: string) => void;
+    onBody: (i: number, v: string) => void;
+    onPaste: (i: number) => (e: React.ClipboardEvent) => void;
+    onDrop: (i: number) => (e: React.DragEvent) => void;
+    onPickFile: (i: number) => (e: React.ChangeEvent<HTMLInputElement>) => void;
+    onRemoveMedia: (i: number, m: number) => void;
+    onSave: () => void;
+    onToggleActive: () => void;
+}) {
+    const filled = msgs.filter((m, i) => m.trim() || medias[i]!.length).length;
+    const sent = schedule?.segments.reduce((a, s) => a + s.successCount, 0) ?? 0;
+
+    return (
+        <div className="space-y-5">
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                <Stat
+                    value={`${filled}/${SLOT_COUNT}`}
+                    label="Ô đã nhập"
+                    hint={filled === SLOT_COUNT ? "đủ cả" : `còn ${SLOT_COUNT - filled} ô trống`}
+                    tone={filled === SLOT_COUNT ? "var(--ok)" : "var(--warn)"}
+                />
+                <Stat value={num(page.activeCustomers)} label="Khách sẽ nhận" hint="còn trong cửa sổ 7 ngày" />
+                <Stat value={num(sent)} label="Tin đã gửi" hint="từ kịch bản này" />
+                <Stat
+                    value={page.isActive ? "Đang chạy" : "Đang tắt"}
+                    label="Trạng thái page"
+                    hint={page.isActive ? "engine đang gửi theo lịch" : "chưa gửi gì"}
+                    tone={page.isActive ? "var(--ok)" : "var(--ink-3)"}
+                />
+            </div>
+
+            <div className="panel">
+                <div
+                    className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3.5"
+                    style={{ borderColor: "var(--line)" }}
+                >
+                    <div>
+                        <h2 className="text-[15px] font-bold">Chuỗi nuôi dưỡng — {SLOT_COUNT} tin</h2>
+                        <p className="mt-0.5 text-[12.5px]" style={{ color: "var(--ink-3)" }}>
+                            Mỗi khách đi hết 7 ngày, mỗi ngày nhận 4 tin. Tin lặp lại sau đúng 3 ngày.
+                        </p>
+                    </div>
+                    <button className="btn btn-primary" onClick={onSave} disabled={saving || filled === 0}>
+                        {saving ? "Đang lưu…" : "Lưu kịch bản"}
+                    </button>
+                </div>
+
+                <div className="space-y-5 p-4">
+                    {CUM.map((cum, ci) => (
+                        <section key={cum.key}>
+                            <div className="mb-2 flex items-baseline gap-2.5">
+                                <h3 className="text-[13.5px] font-bold">
+                                    Cụm {cum.key} · {cum.name}
+                                </h3>
+                                <span className="text-[12px]" style={{ color: "var(--ink-3)" }}>
+                                    {cum.hint}
+                                </span>
+                            </div>
+                            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                                {SLOT_HOURS.map((_, si) => {
+                                    const idx = ci * SLOT_HOURS.length + si;
+                                    return (
+                                        <SlotCard
+                                            key={idx}
+                                            idx={idx}
+                                            label={labels[idx] ?? ""}
+                                            body={msgs[idx] ?? ""}
+                                            media={medias[idx] ?? []}
+                                            uploading={uploadingSlot === idx}
+                                            onLabel={(v) => onLabel(idx, v)}
+                                            onBody={(v) => onBody(idx, v)}
+                                            onPaste={onPaste(idx)}
+                                            onDrop={onDrop(idx)}
+                                            onPickFile={onPickFile(idx)}
+                                            onRemoveMedia={(m) => onRemoveMedia(idx, m)}
+                                        />
+                                    );
+                                })}
+                            </div>
+                        </section>
+                    ))}
+                </div>
+            </div>
+
+            <div className="panel flex flex-wrap items-center gap-4 px-5 py-4">
+                <div className="flex-1 min-w-[280px]">
+                    <div className="text-[14px] font-bold">
+                        {page.isActive ? "Chiến dịch đang chạy" : "Bật chiến dịch"}
+                    </div>
+                    <p className="mt-0.5 text-[13px]" style={{ color: "var(--ink-2)" }}>
+                        {page.isActive
+                            ? `Engine đang gửi tự động cho ${num(page.activeCustomers)} khách theo 4 khung giờ mỗi ngày.`
+                            : filled === 0
+                              ? "Cần nhập nội dung và lưu kịch bản trước khi bật."
+                              : `Bật lên là engine bắt đầu gửi thật cho ${num(page.activeCustomers)} khách. Ba ngày đầu chỉ gửi 25% tệp.`}
+                    </p>
+                </div>
+                <button
+                    className={page.isActive ? "btn btn-danger" : "btn btn-primary"}
+                    onClick={onToggleActive}
+                    disabled={!page.isActive && !schedule?.hasScript}
+                >
+                    {page.isActive ? "Tắt chiến dịch" : "Bật chiến dịch"}
+                </button>
+            </div>
+        </div>
+    );
+}
+
+// ═══ MÀN HÌNH 3 · BẮN TAY ═════════════════════════════════════════════════════
+
+function ManualScreen({
+    page,
+    customers,
+    loading,
+    selected,
+    onToggle,
+    onToggleAll,
+    body,
+    media,
+    uploading,
+    sending,
+    progress,
+    onBody,
+    onPaste,
+    onDrop,
+    onPickFile,
+    onRemoveMedia,
+    onSend,
+    onReload,
+}: {
+    page: PageInfo;
+    customers: Customer[];
+    loading: boolean;
+    selected: Set<string>;
+    onToggle: (id: string) => void;
+    onToggleAll: () => void;
+    body: string;
+    media: string[];
+    uploading: boolean;
+    sending: boolean;
+    progress: { done: number; total: number } | null;
+    onBody: (v: string) => void;
+    onPaste: (e: React.ClipboardEvent) => void;
+    onDrop: (e: React.DragEvent) => void;
+    onPickFile: (e: React.ChangeEvent<HTMLInputElement>) => void;
+    onRemoveMedia: (i: number) => void;
+    onSend: () => void;
+    onReload: () => void;
+}) {
+    const [q, setQ] = useState("");
+    const [shown, setShown] = useState(100);
+
+    const filtered = useMemo(() => {
+        const t = q.trim().toLowerCase();
+        if (!t) return customers;
+        return customers.filter(
+            (c) =>
+                c.customerName.toLowerCase().includes(t) ||
+                c.customerPhone.includes(t) ||
+                c.psid.includes(t)
+        );
+    }, [customers, q]);
+
+    const allShown = filtered.slice(0, shown);
+    const canSend = selected.size > 0 && (body.trim() || media.length > 0) && !sending;
+
+    return (
+        <div className="grid gap-5 xl:grid-cols-[1fr_400px]">
+            {/* Danh sách khách */}
+            <div className="panel overflow-hidden">
+                <div
+                    className="flex flex-wrap items-center gap-2.5 border-b px-4 py-3"
+                    style={{ borderColor: "var(--line)" }}
+                >
+                    <input
+                        className="field max-w-[260px] flex-1 !py-1.5 !text-[13px]"
+                        placeholder="Tìm theo tên, số điện thoại, PSID…"
+                        value={q}
+                        onChange={(e) => setQ(e.target.value)}
+                    />
+                    <button className="btn btn-ghost btn-sm" onClick={onReload}>
+                        Tải lại
+                    </button>
+                    <div className="ml-auto flex items-center gap-2 text-[12.5px]" style={{ color: "var(--ink-3)" }}>
+                        <span className="num">
+                            <b style={{ color: "var(--brand)" }}>{num(selected.size)}</b> đã chọn
+                        </span>
+                        <span>/</span>
+                        <span className="num">{num(filtered.length)} khách</span>
+                    </div>
+                </div>
+
+                {loading ? (
+                    <Empty title="Đang tải danh sách khách…" />
+                ) : customers.length === 0 ? (
+                    <Empty
+                        title="Chưa có khách nào gửi được"
+                        hint="Tệp khách được job đồng bộ đổ vào mỗi đêm. Chỉ khách tương tác trong 7 ngày gần nhất mới gửi được."
+                    />
+                ) : (
+                    <>
+                        <div className="max-h-[62vh] overflow-auto">
+                            <table className="tbl">
+                                <thead className="sticky top-0 z-10">
+                                    <tr>
+                                        <th className="w-10">
+                                            <input
+                                                type="checkbox"
+                                                checked={selected.size > 0 && selected.size === filtered.length}
+                                                onChange={onToggleAll}
+                                                title="Chọn / bỏ chọn tất cả"
+                                            />
+                                        </th>
+                                        <th>Khách hàng</th>
+                                        <th>Số điện thoại</th>
+                                        <th className="text-right">Ngày</th>
+                                        <th>Tương tác cuối</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {allShown.map((c) => (
+                                        <tr
+                                            key={c.id}
+                                            className="cursor-pointer"
+                                            onClick={() => onToggle(c.id)}
+                                            style={selected.has(c.id) ? { background: "var(--brand-soft)" } : undefined}
+                                        >
+                                            <td>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={selected.has(c.id)}
+                                                    onChange={() => onToggle(c.id)}
+                                                    onClick={(e) => e.stopPropagation()}
+                                                />
+                                            </td>
+                                            <td>
+                                                <div className="font-medium">{c.customerName}</div>
+                                                <div className="mono" style={{ color: "var(--ink-3)" }}>
+                                                    {c.psid}
+                                                </div>
+                                            </td>
+                                            <td className="num" style={{ color: c.customerPhone ? "var(--ink-2)" : "var(--ink-3)" }}>
+                                                {c.customerPhone || "—"}
+                                            </td>
+                                            <td className="num text-right">{c.journeyDay}</td>
+                                            <td style={{ color: "var(--ink-3)" }}>{ago(c.lastInteraction)}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                        {filtered.length > shown && (
+                            <div className="border-t px-4 py-2.5 text-center" style={{ borderColor: "var(--line-soft)" }}>
+                                <button className="btn btn-ghost btn-sm" onClick={() => setShown((s) => s + 200)}>
+                                    Hiện thêm ({num(filtered.length - shown)} khách nữa)
+                                </button>
+                            </div>
+                        )}
+                    </>
+                )}
+            </div>
+
+            {/* Soạn tin */}
+            <div className="panel flex h-fit flex-col p-4 xl:sticky xl:top-[124px]">
+                <h2 className="text-[15px] font-bold">Gửi ngay một tin</h2>
+                <p className="mt-0.5 text-[12.5px]" style={{ color: "var(--ink-3)" }}>
+                    Tin này gửi một lần cho khách đang chọn, không ảnh hưởng chuỗi nuôi dưỡng.
+                </p>
+
+                <textarea
+                    className="field mt-3 resize-y !text-[13.5px] leading-relaxed"
+                    rows={7}
+                    value={body}
+                    onChange={(e) => onBody(e.target.value)}
+                    onPaste={onPaste}
+                    onDrop={onDrop}
+                    onDragOver={(e) => e.preventDefault()}
+                    placeholder={uploading ? "Đang tải ảnh lên…" : "Nhập nội dung… (dán ảnh thẳng vào đây cũng được)"}
+                />
+
+                <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                    {media.map((url, i) => (
+                        <span key={url + i} className="relative">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                                src={url}
+                                alt=""
+                                className="h-12 w-12 rounded-md border object-cover"
+                                style={{ borderColor: "var(--line)" }}
+                            />
+                            <button
+                                onClick={() => onRemoveMedia(i)}
+                                className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full text-[10px] font-bold text-white"
+                                style={{ background: "var(--bad)" }}
+                            >
+                                ×
+                            </button>
+                        </span>
+                    ))}
+                    <label
+                        className="flex h-12 w-12 cursor-pointer items-center justify-center rounded-md border border-dashed text-[18px]"
+                        style={{ borderColor: "var(--line)", color: "var(--ink-3)" }}
+                    >
+                        +
+                        <input type="file" accept="image/*" multiple className="hidden" onChange={onPickFile} />
+                    </label>
+                </div>
+
+                {!page.isActive && (
+                    <div
+                        className="mt-3 rounded-lg px-3 py-2.5 text-[12.5px]"
+                        style={{ background: "var(--warn-soft)", color: "var(--warn)" }}
+                    >
+                        Page đang tắt — tin sẽ nằm trong hàng đợi và chỉ gửi khi anh/chị bật page.
+                    </div>
+                )}
+
+                {progress && (
+                    <div className="mt-3">
+                        <div className="mb-1 flex justify-between text-[12px]" style={{ color: "var(--ink-2)" }}>
+                            <span>Đang gửi…</span>
+                            <span className="num">
+                                {progress.done}/{progress.total}
+                            </span>
+                        </div>
+                        <div className="h-1.5 overflow-hidden rounded-full" style={{ background: "var(--line)" }}>
+                            <div
+                                className="h-full rounded-full transition-all"
+                                style={{
+                                    background: "var(--brand)",
+                                    width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%`,
+                                }}
+                            />
+                        </div>
+                    </div>
+                )}
+
+                <button className="btn btn-primary mt-3.5 w-full !py-2.5" onClick={onSend} disabled={!canSend}>
+                    {sending
+                        ? "Đang xếp hàng đợi…"
+                        : selected.size === 0
+                          ? "Chọn khách để gửi"
+                          : `Gửi cho ${num(selected.size)} khách`}
+                </button>
+            </div>
+        </div>
+    );
+}
+
+// ═══ ỨNG DỤNG ═════════════════════════════════════════════════════════════════
+
+export default function App() {
+    const [screen, setScreen] = useState<Screen>("tong-quan");
     const [pages, setPages] = useState<PageInfo[]>([]);
-    const [selectedPageId, setSelectedPageId] = useState("");
-    const [isLoadingPages, setIsLoadingPages] = useState(false);
+    const [loadingPages, setLoadingPages] = useState(true);
+    const [pageId, setPageId] = useState("");
+
+    const [schedules, setSchedules] = useState<Schedule[]>([]);
     const [customers, setCustomers] = useState<Customer[]>([]);
-    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-    // 12 ô soạn, bày thành lưới 3 cụm × 4 khung giờ.
-    // v1 chỉ có 4 ô rời; chuỗi nuôi dưỡng cần 12 tin xoay vòng nên gom thành mảng.
+    const [loadingCust, setLoadingCust] = useState(false);
+    const [selected, setSelected] = useState<Set<string>>(new Set());
+
     const [msgs, setMsgs] = useState<string[]>(() => Array(SLOT_COUNT).fill(""));
+    const [labels, setLabels] = useState<string[]>(() => Array(SLOT_COUNT).fill(""));
     const [medias, setMedias] = useState<string[][]>(() => Array.from({ length: SLOT_COUNT }, () => []));
-    const abortControllerRef = useRef<AbortController | null>(null);
-    const [isLoadingShops, setIsLoadingShops] = useState(true);
-    const [isLoadingCustomers, setIsLoadingCustomers] = useState(false);
-    const [isSending, setIsSending] = useState(false);
-    const [sendResults, setSendResults] = useState<SendResult[] | null>(null);
-    const [currentPage, setCurrentPage] = useState(1);
-    const [totalCustomers, setTotalCustomers] = useState(0);
-    const [totalPages, setTotalPages] = useState(1);
+    const [uploadingSlot, setUploadingSlot] = useState<number | null>(null);
+    const [saving, setSaving] = useState(false);
 
-    // Filter states
-    const [filterPurchase, setFilterPurchase] = useState<'all' | 'no_purchase' | 'has_purchase'>('all');
-    const [filterTimeRange, setFilterTimeRange] = useState<'all' | '24h' | '7d' | '30d' | '90d'>('all');
-    const [filterGender, setFilterGender] = useState<'all' | 'male' | 'female'>('all');
-    const [filterActive, setFilterActive] = useState(false);
-    // Tuỳ chọn: loại khách vừa tương tác <24h (tránh bắn dồn dập khách đang chat)
-    const [excludeRecent24h, setExcludeRecent24h] = useState(false);
-    const [pageSearch, setPageSearch] = useState("");
-    const [isPageDropdownOpen, setIsPageDropdownOpen] = useState(false);
-    const [visibleCount, setVisibleCount] = useState(100);
+    const [manualBody, setManualBody] = useState("");
+    const [manualMedia, setManualMedia] = useState<string[]>([]);
+    const [manualUploading, setManualUploading] = useState(false);
+    const [sending, setSending] = useState(false);
+    const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
 
-    // ─── Schedule states ──────────────────────────────────────────────────────
-    const [schedules, setSchedules] = useState<BroadcastSchedule[]>([]);
-    const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
-    const [editNote, setEditNote] = useState("");
-    const [scheduleToast, setScheduleToast] = useState<string | null>(null);
-    const [showSchedulePreview, setShowSchedulePreview] = useState(false);
-    const [scheduledSegments, setScheduledSegments] = useState<Set<number>>(new Set());
-    const [isLoadingSchedules, setIsLoadingSchedules] = useState(false);
-    // Bắn ngay 1 lịch: id của thẻ đang mở popup chọn đoạn + segIdx đang gửi
-    const [fireNowId, setFireNowId] = useState<string | null>(null);
-    const [firingSegKey, setFiringSegKey] = useState<string | null>(null);
-    const fireAbortRef = useRef<AbortController | null>(null);
+    const [toast, setToast] = useState<{ text: string; kind: "ok" | "bad" } | null>(null);
+    const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-    // ─── Toast helper: clear timer cũ để toast mới không bị xoá sớm ──────────
-    const toastTimerRef = useRef<NodeJS.Timeout | null>(null);
-    const showToast = useCallback((msg: string, ms = 3000) => {
-        setScheduleToast(msg);
-        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-        toastTimerRef.current = setTimeout(() => setScheduleToast(null), ms);
-    }, []);
-    useEffect(() => () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); }, []);
-
-    // ─── Load schedules from BigQuery API on mount ────────────────────────────
-    const refreshSchedules = useCallback(async () => {
-        setIsLoadingSchedules(true);
-        const list = await fetchSchedulesFromAPI();
-        if (list) setSchedules(list);
-        else showToast("⚠️ Không tải được danh sách lịch — giữ danh sách cũ");
-        setIsLoadingSchedules(false);
-    }, [showToast]);
-
-    useEffect(() => { refreshSchedules(); }, [refreshSchedules]);
-
-    // ─── Auto-refresh schedules every 60s to see cron updates ─────────────────
-    useEffect(() => {
-        const interval = setInterval(() => {
-            fetchSchedulesFromAPI().then(list => { if (list) setSchedules(list); });
-        }, 60_000);
-        return () => clearInterval(interval);
+    const say = useCallback((text: string, kind: "ok" | "bad" = "ok", ms = 5000) => {
+        if (toastTimer.current) clearTimeout(toastTimer.current);
+        setToast({ text, kind });
+        toastTimer.current = setTimeout(() => setToast(null), ms);
     }, []);
 
-    // ✅ Auto-fire giờ chạy trên SERVER qua Vercel Cron (/api/broadcast/cron)
-    // Client chỉ polling để hiển thị trạng thái — KHÔNG cần giữ tab mở nữa!
+    const page = useMemo(() => pages.find((p) => p.pageId === pageId) ?? null, [pages, pageId]);
+    const schedule = useMemo(() => schedules.find((s) => s.pageId === pageId) ?? null, [schedules, pageId]);
 
-    // Load shops
-    useEffect(() => {
-        apiFetch("/api/broadcast")
-            .then((r) => r.json())
-            .then((data) => { if (data.shops) setShops(data.shops); })
-            .catch(console.error)
-            .finally(() => setIsLoadingShops(false));
-    }, []);
-
-    // Load pages when shop changes (or ALL pages when no shop)
-    const loadPages = useCallback(async (shopId: string) => {
-        setIsLoadingPages(true);
-        setPages([]);
-        setSelectedPageId("");
-        setCustomers([]);
-        setSendResults(null);
-
+    // ─── Tải dữ liệu ──────────────────────────────────────────────────────
+    const loadPages = useCallback(async () => {
+        setLoadingPages(true);
         try {
-            // If no shopId → fetch pages from ALL shops
-            const url = shopId
-                ? `/api/broadcast?shopId=${shopId}&getPages=true`
-                : `/api/broadcast?getPages=true`;
-            const res = await apiFetch(url);
-            const data = await res.json();
-            if (data.pages) {
-                setPages(data.pages);
-            } else if (data.error) {
-                showToast(`❌ Lỗi tải pages: ${data.error}`, 6000);
-            }
-        } catch (err) {
-            console.error("Load pages error:", err);
-            showToast("❌ Không tải được danh sách page (lỗi mạng)", 6000);
+            const [pr, sr] = await Promise.all([
+                apiFetch("/api/broadcast?getPages=true"),
+                apiFetch("/api/broadcast/schedule"),
+            ]);
+            const pd = await pr.json();
+            const sd = await sr.json();
+            if (pd.pages) setPages(pd.pages);
+            if (sd.schedules) setSchedules(sd.schedules);
+        } catch {
+            say("Không tải được danh sách page", "bad");
         } finally {
-            setIsLoadingPages(false);
+            setLoadingPages(false);
         }
-    }, [showToast]);
+    }, [say]);
 
-    // Auto-load ALL pages on mount (TH2: không cần chọn shop)
     useEffect(() => {
-        loadPages("");
+        void loadPages();
     }, [loadPages]);
 
-    // CRM warning state
-    const [crmWarning, setCrmWarning] = useState<string | null>(null);
-
-    // Load customers (with optional page filter)
-    const loadCustomers = useCallback(async (shopId: string, page = 1, pageFilter = "") => {
-        if (!shopId && !pageFilter) return; // cho phép không chọn shop nếu có pageFilter
-        setIsLoadingCustomers(true);
-        setSelectedIds(new Set());
-        setSendResults(null);
-        setCrmWarning(null);
-        setVisibleCount(100);
-
-        try {
-            let url = `/api/broadcast?page=${page}`;
-            if (shopId) url += `&shopId=${shopId}`;
-            if (pageFilter) url += `&pageFilter=${encodeURIComponent(pageFilter)}`;
-
-            const res = await apiFetch(url);
-            const data = await res.json();
-
-            if (data.customers) {
-                setCustomers(data.customers);
-                setTotalCustomers(data.total || data.customers.length);
-                setTotalPages(data.totalPages || 1);
-                setCurrentPage(data.page || page);
-                // Show CRM warning if present
-                if (data.crmWarning) {
-                    setCrmWarning(data.crmWarning);
-                }
-            } else if (data.error) {
-                console.error("Load customers error:", data.error);
+    const loadCustomers = useCallback(
+        async (pid: string) => {
+            if (!pid) return;
+            setLoadingCust(true);
+            setSelected(new Set());
+            try {
+                const r = await apiFetch(`/api/broadcast?pageFilter=${encodeURIComponent(pid)}`);
+                const d = await r.json();
+                setCustomers(d.customers ?? []);
+            } catch {
+                say("Không tải được danh sách khách", "bad");
                 setCustomers([]);
-                showToast(`❌ Lỗi tải khách: ${data.error}`, 8000);
+            } finally {
+                setLoadingCust(false);
             }
-        } catch (err) {
-            console.error("Load customers error:", err);
-            setCustomers([]);
-            showToast("❌ Không tải được danh sách khách (lỗi mạng) — bấm 🔍 Lọc data để thử lại", 8000);
-        } finally {
-            setIsLoadingCustomers(false);
+        },
+        [say]
+    );
+
+    // Đổ nội dung kịch bản vào ô soạn theo segIdx — KHÔNG theo vị trí mảng, vì
+    // kịch bản chỉ chứa các ô có nội dung, đổ theo vị trí sẽ lệch khung giờ.
+    useEffect(() => {
+        const nm: string[] = Array(SLOT_COUNT).fill("");
+        const nl: string[] = Array(SLOT_COUNT).fill("");
+        const nd: string[][] = Array.from({ length: SLOT_COUNT }, () => []);
+        for (const seg of schedule?.segments ?? []) {
+            const i = seg.segIdx;
+            if (i >= 0 && i < SLOT_COUNT) {
+                nm[i] = seg.message ?? "";
+                nl[i] = seg.label ?? "";
+                nd[i] = seg.media ?? [];
+            }
         }
-    }, [showToast]);
+        setMsgs(nm);
+        setLabels(nl);
+        setMedias(nd);
+    }, [schedule]);
 
-    // Toggle selection
-    const toggleSelect = (id: string) => {
-        setSelectedIds((prev) => {
-            const next = new Set(prev);
-            next.has(id) ? next.delete(id) : next.add(id);
-            return next;
-        });
-    };
+    useEffect(() => {
+        if (pageId && screen === "ban-tay") void loadCustomers(pageId);
+    }, [pageId, screen, loadCustomers]);
 
-    // ─── Purchase tag detection ─────────────────────────────────────
-    // Tags liên quan đến đã mua/đã gửi hàng (check cả string và lowercase)
-    const PURCHASE_TAGS = ['đã gửi', 'đã nhận', 'da gui', 'da nhan', 'mua hàng', 'mua hang', 'đã mua', 'da mua', 'shipped', 'delivered', 'đã gửi hàng', 'đã chốt', 'da chot', 'chốt đơn', 'chot don'];
-    const hasPurchaseTag = (c: Customer): boolean => {
-        const tagStr = (c.tags || []).map(t => String(t).toLowerCase()).join(' ');
-        return PURCHASE_TAGS.some(pt => tagStr.includes(pt));
-    };
-    const isPurchasedCustomer = (c: Customer): boolean => {
-        return !!c.customerPhone || c.orderCount > 0 || hasPurchaseTag(c);
-    };
-
-    // ─── Filter logic ─────────────────────────────────────────────
-    // Khách ngoài cửa sổ 7 ngày chắc chắn lỗi #10 nên LUÔN ẩn khỏi danh sách gửi.
-    const filteredCustomers = useMemo(() => {
-        let result = customers;
-
-        // ═══ LUÔN chỉ giữ khách trong cửa sổ 7 ngày ═══
-        const nowMs = Date.now();
-        const cutoffWindow = nowMs - SEND_WINDOW_MS;
-        result = result.filter(c => {
-            const t = new Date(c.lastInteraction || c.updatedAt).getTime();
-            return Number.isFinite(t) && t >= cutoffWindow;
-        });
-
-        // Tuỳ chọn: loại thêm khách vừa tương tác <24h
-        if (excludeRecent24h) {
-            const cutoff24h = nowMs - 86400000;
-            result = result.filter(c => {
-                const t = new Date(c.lastInteraction || c.updatedAt).getTime();
-                return t < cutoff24h;
-            });
-        }
-
-        // ═══ LUÔN áp dụng purchase filter (không cần filterActive) ═══
-        if (filterPurchase === 'no_purchase') {
-            // Chưa mua = KHÔNG có SĐT VÀ orderCount = 0 VÀ KHÔNG có tag mua hàng
-            result = result.filter(c => !isPurchasedCustomer(c));
-        } else if (filterPurchase === 'has_purchase') {
-            // Đã mua = có SĐT HOẶC có orderCount > 0 HOẶC có tag mua hàng
-            result = result.filter(c => isPurchasedCustomer(c));
-        }
-
-        // Các filter khác chỉ áp dụng khi filterActive
-        if (!filterActive && filterPurchase === 'all') return result;
-
-        // Time range filter (optional, thêm lọc theo khoảng thời gian)
-        if (filterTimeRange !== 'all') {
-            const now = Date.now();
-            const msMap: Record<string, number> = { '24h': 86400000, '7d': 604800000, '30d': 2592000000, '90d': 7776000000 };
-            const cutoff = now - (msMap[filterTimeRange] || 0);
-            result = result.filter(c => {
-                const t = new Date(c.lastInteraction || c.updatedAt).getTime();
-                return t >= cutoff;
-            });
-        }
-
-        // Gender filter (heuristic by name — chỉ match tiền tố xưng hô,
-        // KHÔNG match tên riêng "Anh"/"Nam" vì rất phổ biến ở cả 2 giới)
-        if (filterGender !== 'all') {
-            result = result.filter(c => {
-                const name = c.customerName.toLowerCase().trim();
-                if (filterGender === 'female') {
-                    return /^(chị|chi|ms|mrs|miss|cô|co|nữ|nu|bà|ba|madam)\b/i.test(name);
-                }
-                return /^(anh|mr|ông|ong|bro|bác|bac)\b/i.test(name);
-            });
-        }
-
-        return result;
-    }, [customers, filterPurchase, filterTimeRange, filterGender, filterActive, excludeRecent24h]);
-
-    // Số khách bị ẩn vì ngoài cửa sổ 7 ngày (hiển thị cho user biết, không âm thầm)
-    const outsideWindowCount = useMemo(() => {
-        const cutoff = Date.now() - SEND_WINDOW_MS;
-        return customers.filter(c => {
-            const t = new Date(c.lastInteraction || c.updatedAt).getTime();
-            return !Number.isFinite(t) || t < cutoff;
-        }).length;
-    }, [customers]);
-
-    const toggleSelectAll = () => {
-        // ═══ FIX: Select All chỉ chọn filteredCustomers, không phải tất cả ═══
-        if (selectedIds.size === filteredCustomers.length && filteredCustomers.length > 0) {
-            setSelectedIds(new Set());
-        } else {
-            setSelectedIds(new Set(filteredCustomers.map((c) => c.id)));
-        }
-    };
-
-    // Combine 4 message boxes
-    const messages = msgs;
-    const mediaArrays = medias;
-    const setMessageAt = (i: number, v: string) =>
-        setMsgs((prev) => prev.map((x, k) => (k === i ? v : x)));
-    const setMediaAt = (i: number, fn: (prev: string[]) => string[]) =>
-        setMedias((prev) => prev.map((x, k) => (k === i ? fn(x) : x)));
-    const totalMediaCount = medias.reduce((a, m) => a + m.length, 0);
-
-    // Handle multi-media upload per box
-    // Tải ảnh LÊN SERVER rồi giữ link, không nhồi base64 vào state.
-    // v1 giữ base64 nên mỗi lịch phình vài MB và ảnh phải kèm theo mọi request gửi.
-    const [uploadingBox, setUploadingBox] = useState<number | null>(null);
-
-    const uploadFiles = useCallback(async (boxIdx: number, files: File[]) => {
-        const imgs = files.filter((f) => f.type.startsWith("image/"));
-        if (imgs.length === 0) return;
-        setUploadingBox(boxIdx);
-        try {
+    // ─── Tải ảnh ──────────────────────────────────────────────────────────
+    const upload = useCallback(
+        async (files: File[]): Promise<string[]> => {
+            const imgs = files.filter((f) => f.type.startsWith("image/"));
+            if (imgs.length === 0) return [];
             const fd = new FormData();
             for (const f of imgs) fd.append("images", f);
-            if (selectedPageId) fd.append("pageId", selectedPageId);
+            if (pageId) fd.append("pageId", pageId);
             const res = await apiFetch("/api/upload", { method: "POST", body: fd });
-            const data = await res.json();
-            if (!res.ok || !data.media) {
-                showToast(`❌ Tải ảnh lỗi: ${data.error ?? res.status}`, 6000);
+            const d = await res.json();
+            if (!res.ok || !d.media) {
+                say(d.error ?? "Tải ảnh lên thất bại", "bad");
+                return [];
+            }
+            return (d.media as { url: string }[]).map((m) => m.url);
+        },
+        [pageId, say]
+    );
+
+    const addSlotMedia = useCallback(
+        async (i: number, files: File[]) => {
+            setUploadingSlot(i);
+            const urls = await upload(files);
+            if (urls.length) setMedias((prev) => prev.map((m, k) => (k === i ? [...m, ...urls] : m)));
+            setUploadingSlot(null);
+        },
+        [upload]
+    );
+
+    const addManualMedia = useCallback(
+        async (files: File[]) => {
+            setManualUploading(true);
+            const urls = await upload(files);
+            if (urls.length) setManualMedia((prev) => [...prev, ...urls]);
+            setManualUploading(false);
+        },
+        [upload]
+    );
+
+    // ─── Lưu kịch bản ─────────────────────────────────────────────────────
+    const saveScript = useCallback(async () => {
+        if (!pageId) return;
+        setSaving(true);
+        try {
+            const segments = msgs.map((m, i) => ({
+                segIdx: i,
+                hour: SLOT_HOURS[i % SLOT_HOURS.length],
+                label: labels[i] ?? "",
+                message: m,
+                media: medias[i] ?? [],
+            }));
+            const res = await apiFetch("/api/broadcast/schedule", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "save", schedule: { pageId, segments } }),
+            });
+            const d = await res.json();
+            if (!res.ok) {
+                say(d.error ?? "Lưu thất bại", "bad");
                 return;
             }
-            const urls = (data.media as { url: string }[]).map((m) => m.url);
-            setMediaAt(boxIdx, (prev) => [...prev, ...urls]);
+            say(d.message ?? "Đã lưu");
+            await loadPages();
         } catch {
-            showToast("❌ Không tải được ảnh lên (lỗi mạng)", 6000);
+            say("Lỗi kết nối khi lưu", "bad");
         } finally {
-            setUploadingBox(null);
+            setSaving(false);
         }
-    }, [selectedPageId, showToast]);
+    }, [pageId, msgs, labels, medias, say, loadPages]);
 
-    const handleMediaUpload = (boxIdx: number) => (e: React.ChangeEvent<HTMLInputElement>) => {
-        const files = e.target.files;
-        if (files && files.length) void uploadFiles(boxIdx, Array.from(files));
-        e.target.value = '';
-    };
-
-    /** Dán ảnh thẳng từ clipboard vào ô soạn — thao tác hay dùng nhất khi lấy ảnh từ chat. */
-    const handlePaste = (boxIdx: number) => (e: React.ClipboardEvent) => {
-        const files = Array.from(e.clipboardData?.files ?? []);
-        if (files.length) { e.preventDefault(); void uploadFiles(boxIdx, files); }
-    };
-
-    const handleDrop = (boxIdx: number) => (e: React.DragEvent) => {
-        const files = Array.from(e.dataTransfer?.files ?? []);
-        if (files.length) { e.preventDefault(); void uploadFiles(boxIdx, files); }
-    };
-
-    const removeMedia = (boxIdx: number, mediaIdx: number) => {
-        setMediaAt(boxIdx, (prev) => prev.filter((_, i) => i !== mediaIdx));
-    };
-
-    // Get shop timezone (derived from selected page's shopName)
-    const selectedPage = pages.find(p => p.pageId === selectedPageId);
-    const shopName = selectedPage?.shopName || shops.find(s => s.shop_id === selectedShopId)?.name || "";
-    const shopTz = SHOP_TIMEZONES[shopName] || { offset: 3, label: "UTC+3", flag: "🌍" };
-
-    // ─── Hẹn tất cả đoạn theo mapping cố định ───────────────────────────────
-    // Đoạn 1 → 6h, Đoạn 2 → 11h, Đoạn 3 → 17h, Đoạn 4 → 21h
-    const SEGMENT_HOUR_MAP = [6, 11, 17, 21];
-
-    const handleScheduleAll = async () => {
-        if (!selectedPageId) {
-            showToast("⚠️ Chọn Page trước!");
+    // ─── Bật / tắt page ───────────────────────────────────────────────────
+    const toggleActive = useCallback(async () => {
+        if (!page) return;
+        const turningOn = !page.isActive;
+        if (
+            turningOn &&
+            !confirm(
+                `Bật chiến dịch cho "${page.name}"?\n\nEngine sẽ bắt đầu gửi tin thật cho ${num(
+                    page.activeCustomers
+                )} khách hàng.\nBa ngày đầu chỉ gửi 25% tệp.`
+            )
+        )
             return;
-        }
-        // Tìm đoạn nào đã có nội dung
-        const filledSegments = messages
-            .map((m, i) => ({ idx: i, msg: m.trim(), media: mediaArrays[i] }))
-            .filter(s => s.msg || s.media.length > 0);
 
-        if (filledSegments.length === 0) {
-            showToast("⚠️ Nhập ít nhất 1 đoạn tin nhắn trước!");
-            return;
-        }
-
-        const pageName = pages.find(p => p.pageId === selectedPageId)?.name || selectedPageId;
-        const tz = shopTz.offset;
-
-        // ═══ LƯU ẢNH: giữ thẳng base64 trong lịch (tự chứa, không phụ thuộc dịch vụ ngoài) ═══
-        // fireSegment gửi base64 trực tiếp lên Facebook dạng bytes — không cần upload/host.
-        showToast("⏳ Đang lưu lịch...", 15000);
-        const uploadedSegments = filledSegments.map((seg) => ({
-            ...seg,
-            mediaUrls: (seg.media || []).filter(Boolean), // base64 data URL hoặc http URL (chế độ Sửa) — giữ nguyên
-        }));
-
-        // ═══ TẠO 1 ENTRY DUY NHẤT chứa tất cả segments ═══
-        // Tìm lịch cũ theo PAGE (không phụ thuộc shopId) — tránh việc cùng 1 page
-        // tồn tại 2 lịch song song (id khác nhau do lúc hẹn có/không chọn shop)
-        // → cron bắn cả 2 → khách nhận tin đôi
-        const existing = schedules.find(x => x.pageId === selectedPageId && x.id.endsWith('_combined'));
-        const scheduleId = existing?.id || `${selectedShopId}_${selectedPageId}_combined`;
-        const segs: ScheduleSegment[] = uploadedSegments.map(seg => ({
-            segIdx: seg.idx,
-            hour: SEGMENT_HOUR_MAP[seg.idx],
-            message: seg.msg,
-            media: seg.mediaUrls || [],
-        }));
-        const firstHour = segs[0].hour;
-
-        const entry: BroadcastSchedule = {
-            id: scheduleId,
-            shopId: selectedShopId,
-            shopName: shopName,
-            pageId: selectedPageId,
-            pageName,
-            hour: firstHour,
-            messages: segs.map(s => s.message),
-            segments: segs,
-            filterPurchase,
-            filterTimeRange,
-            isActive: true,
-            createdAt: existing?.createdAt || new Date().toISOString(),
-            lastFiredAt: existing?.lastFiredAt || null,
-            nextFireAt: calcNextFireAt(firstHour, tz),
-            note: existing?.note,
-            recipientCount: filteredCustomers.length,
-        };
-
-        setScheduledSegments(new Set(filledSegments.map(s => s.idx)));
-        const hourList = segs.map(s => `${s.hour}h`).join(', ');
-
-        saveScheduleToAPI(entry).then(ok => {
-            if (ok) {
-                refreshSchedules();
-                showToast(`✅ Đã hẹn 1 lịch (${hourList}) cho ${pageName}`, 4000);
-            } else {
-                showToast(`❌ Lỗi lưu lịch — kiểm tra mạng rồi thử lại`, 4000);
-            }
+        const res = await apiFetch("/api/broadcast/schedule", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "toggle", scheduleId: page.pageId }),
         });
-    };
-
-    const toggleScheduleActive = async (id: string) => {
-        const ok = await toggleScheduleAPI(id);
-        if (!ok) showToast("❌ Lỗi bật/tắt lịch — thử lại");
-        refreshSchedules();
-    };
-
-    const handleDeleteSchedule = async (id: string) => {
-        const s = schedules.find(x => x.id === id);
-        if (!confirm(`Xoá lịch "${s?.pageName || id}"?\n\nHành động này không hoàn tác được.`)) return;
-        const ok = await deleteScheduleFromAPI(id);
-        if (!ok) showToast("❌ Lỗi xoá lịch — thử lại");
-        refreshSchedules();
-    };
-
-    // ─── BẮN NGAY 1 đoạn của 1 lịch (bỏ qua giờ hẹn) ──────────────────────────
-    const handleFireNow = async (s: BroadcastSchedule, segIdx: number, hour: number) => {
-        const segKey = `${s.id}_${segIdx}`;
-        if (firingSegKey) return; // đang gửi, chặn bấm trùng
-        if (!confirm(`⚡ Bắn NGAY đoạn ${SCHEDULE_LABELS[hour] || hour + "h"} cho "${s.pageName}"?\n\nTin sẽ gửi tới khách hàng ngay lập tức.`)) return;
-        const controller = new AbortController();
-        fireAbortRef.current = controller;
-        setFiringSegKey(segKey);
-        setFireNowId(null);
-        showToast(`⏳ Đang bắn ngay đoạn ${SCHEDULE_LABELS[hour] || hour + "h"}... (có thể bấm Huỷ bắn)`, 600000);
-        try {
-            const res = await apiFetch(`/api/broadcast/cron?fire=${encodeURIComponent(s.id)}&seg=${segIdx}`, { signal: controller.signal });
-            const data = await res.json();
-            if (data.ok && data.result) {
-                const r = data.result;
-                showToast(`✅ Đã bắn: ${r.success}/${r.recipients} khách thành công${r.errors ? ` (❌${r.errors} lỗi)` : ""}`, 8000);
-            } else {
-                showToast(`❌ Lỗi bắn ngay: ${data.error || "không rõ"}`, 8000);
-            }
-        } catch (err) {
-            if (err instanceof Error && err.name === "AbortError") {
-                showToast(`⛔ Đã huỷ bắn (các tin đã gửi trước đó vẫn được gửi)`, 5000);
-            } else {
-                showToast(`❌ Lỗi kết nối: ${err instanceof Error ? err.message : "unknown"}`, 5000);
-            }
-        } finally {
-            fireAbortRef.current = null;
-            setFiringSegKey(null);
-            refreshSchedules();
-        }
-    };
-
-    // ─── HUỶ BẮN: ngắt request đang gửi → server dừng giữa các lô ──────────────
-    const handleCancelFire = () => {
-        if (fireAbortRef.current) {
-            fireAbortRef.current.abort();
-            showToast(`⛔ Đang huỷ bắn...`);
-        }
-    };
-
-    // ⚠️ Việc BẮN theo lịch do cron phía server đảm nhiệm (pm2 talpha-cron / Vercel Cron).
-    // Client KHÔNG tự gọi cron nữa — tránh nhiều tab cùng kích hoạt bắn trùng.
-    // Trạng thái lịch đã được auto-refresh mỗi 60s ở effect phía trên.
-
-    const startEditNote = (s: BroadcastSchedule) => {
-        setEditingScheduleId(s.id);
-        setEditNote(s.note || "");
-    };
-
-    const saveNote = async (id: string) => {
-        await saveNoteAPI(id, editNote);
-        refreshSchedules();
-        setEditingScheduleId(null);
-    };
-
-    // ═══ SỬA NỘI DUNG: Load schedule vào 4 ô message + media ═══
-    const handleEditScheduleContent = (s: BroadcastSchedule) => {
-        // Map theo segIdx chứ KHÔNG theo vị trí mảng — s.messages/segments chỉ chứa
-        // các đoạn CÓ nội dung (vd chỉ Đoạn 2 + Đoạn 4), nếu đổ theo vị trí thì
-        // nội dung 11h nhảy vào ô Đoạn 1 (6h) → lưu lại là lệch hết khung giờ
-        // Đổ theo segIdx chứ KHÔNG theo vị trí mảng: kịch bản chỉ chứa các ô CÓ
-        // nội dung, đổ theo vị trí sẽ làm tin của khung 11h nhảy vào ô khung 6h.
-        const nextMsgs: string[] = Array(SLOT_COUNT).fill('');
-        const nextMedias: string[][] = Array.from({ length: SLOT_COUNT }, () => []);
-        for (const seg of s.segments || []) {
-            const i = seg.segIdx ?? 0;
-            if (i >= 0 && i < SLOT_COUNT) {
-                nextMsgs[i] = seg.message || '';
-                nextMedias[i] = seg.media || [];
-            }
-        }
-        setMsgs(nextMsgs);
-        setMedias(nextMedias);
-        
-        // Select đúng shop + page
-        if (s.shopId && s.shopId !== selectedShopId) setSelectedShopId(s.shopId);
-        if (s.pageId && s.pageId !== selectedPageId) setSelectedPageId(s.pageId);
-        
-        // Scroll lên đầu
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-        showToast(`✏️ Đang sửa lịch "${s.pageName}" — chỉnh sửa xong bấm "Hẹn lịch" để lưu`, 5000);
-    };
-
-    // Send a specific box's message
-    const sendingLockRef = useRef(false);
-    const lastSentTimeRef = useRef(0); // Cooldown tracker
-    const [batchProgress, setBatchProgress] = useState<{ sent: number; total: number } | null>(null);
-    const [sendingLog, setSendingLog] = useState<{ name: string; status: 'pending' | 'sending' | 'success' | 'error'; error?: string }[]>([]);
-    const logScrollRef = useRef<HTMLDivElement>(null);
-    const [sendDropdownOpen, setSendDropdownOpen] = useState(false);
-    const [forceGraphAPI, setForceGraphAPI] = useState(false);
-    // ═══ AUTO-BATCH: Chia nhỏ recipients thành từng đợt ═══
-    const BATCH_SIZE = 100;     // Mỗi đợt gửi 100 người
-    const BATCH_DELAY_SEC = 8;  // Nghỉ giữa các đợt (giây) — giảm để nhanh hơn, tăng nếu bị #2022
-    const SEND_CHUNK = 16;      // Số người gửi chung 1 request (server xử lý song song)
-    const [autoBatchInfo, setAutoBatchInfo] = useState<{ currentBatch: number; totalBatches: number; totalSent: number; totalRecipients: number } | null>(null);
-    const [batchCountdown, setBatchCountdown] = useState(0); // Countdown giữa các đợt
-
-    /**
-     * Bắn ngay cho những khách đang tích chọn.
-     *
-     * KHÔNG tự gửi ở trình duyệt. Chỉ đẩy vào hàng đợi, job send (chạy mỗi phút)
-     * mới gửi thật. Nhờ vậy lượt bắn tay đi qua đúng đường của engine: chống
-     * trùng, cầu dao page khi dính #2022, hãm tốc khi lỗi cao, nhật ký từng tin.
-     * Bản v1 gửi thẳng từ trình duyệt nên bỏ qua sạch các lớp bảo vệ đó.
-     */
-    const handleSendBox = async (boxIdx: number) => {
-        if (sendingLockRef.current) return;
-
-        const msg = messages[boxIdx]?.trim() ?? "";
-        const boxMedia = mediaArrays[boxIdx] ?? [];
-        if (!msg && boxMedia.length === 0) {
-            showToast("⚠️ Ô này chưa có nội dung và cũng chưa có ảnh");
+        const d = await res.json();
+        if (!res.ok) {
+            say(d.error ?? "Không đổi được trạng thái", "bad");
             return;
         }
-        const chosen = filteredCustomers.filter((c) => selectedIds.has(c.id));
-        if (chosen.length === 0) {
-            showToast("⚠️ Chưa chọn khách nào — tích vào ô vuông bên trái danh sách");
-            return;
-        }
-        if (!confirm(`Gửi tin ${boxIdx + 1} cho ${chosen.length} khách?\n\nTin sẽ vào hàng đợi và được gửi trong vòng 1 phút.`)) return;
+        say(d.isActive ? "Đã BẬT chiến dịch — engine bắt đầu gửi" : "Đã tắt chiến dịch");
+        await loadPages();
+    }, [page, say, loadPages]);
 
-        sendingLockRef.current = true;
-        setIsSending(true);
-        setSendResults(null);
+    // ─── Bắn tay ──────────────────────────────────────────────────────────
+    const sendManual = useCallback(async () => {
+        if (!page || selected.size === 0) return;
+        const psids = customers.filter((c) => selected.has(c.id)).map((c) => c.psid);
+        if (!confirm(`Gửi cho ${psids.length} khách?\n\nTin vào hàng đợi và được gửi trong vòng 1 phút.`)) return;
+
+        setSending(true);
         const since = new Date().toISOString();
-
         try {
             const res = await apiFetch("/api/send", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    pageId: selectedPageId,
-                    psids: chosen.map((c) => c.psid),
-                    message: msg,
-                    media: boxMedia,
-                }),
+                body: JSON.stringify({ pageId, psids, message: manualBody, media: manualMedia }),
             });
-            const data = await res.json();
+            const d = await res.json();
             if (!res.ok) {
-                showToast(`❌ ${data.error ?? "Không xếp được hàng đợi"}`, 8000);
+                say(d.error ?? "Không xếp được hàng đợi", "bad", 8000);
                 return;
             }
-            showToast(`✅ ${data.message}`, 8000);
-            if (!data.pageActive) {
-                showToast("⚠️ Page đang TẮT — engine sẽ không gửi cho tới khi bật page", 10000);
-            }
+            say(d.message, "ok", 8000);
 
-            // Theo dõi tiến trình: hỏi server cho tới khi hàng đợi rỗng
             const deadline = Date.now() + 10 * 60_000;
             const poll = async () => {
-                if (Date.now() > deadline) { setBatchProgress(null); return; }
+                if (Date.now() > deadline) return setProgress(null);
                 try {
-                    const r = await apiFetch(`/api/send?pageId=${encodeURIComponent(selectedPageId)}&since=${encodeURIComponent(since)}`);
+                    const r = await apiFetch(
+                        `/api/send?pageId=${encodeURIComponent(pageId)}&since=${encodeURIComponent(since)}`
+                    );
                     const p = await r.json();
-                    setBatchProgress({ sent: p.done ?? 0, total: p.total ?? 0 });
-                    if ((p.queued ?? 0) + (p.sending ?? 0) > 0) {
-                        setTimeout(poll, 3000);
-                    } else {
-                        showToast(`📨 Xong: ${p.sent} gửi được${p.failed ? ` · ${p.failed} lỗi` : ""}${p.skipped ? ` · ${p.skipped} bỏ qua` : ""}`, 10000);
+                    setProgress({ done: p.done ?? 0, total: p.total ?? 0 });
+                    if ((p.queued ?? 0) + (p.sending ?? 0) > 0) setTimeout(poll, 3000);
+                    else {
+                        say(`Xong: ${p.sent} gửi được${p.failed ? ` · ${p.failed} lỗi` : ""}`, "ok", 9000);
+                        setTimeout(() => setProgress(null), 4000);
                     }
-                } catch { /* mạng chập chờn — dừng theo dõi, tin vẫn đang gửi */ }
+                } catch {
+                    setProgress(null);
+                }
             };
             void poll();
-        } catch (err) {
-            showToast(`❌ Lỗi kết nối: ${err instanceof Error ? err.message : "không rõ"}`, 8000);
         } finally {
-            sendingLockRef.current = false;
-            setIsSending(false);
-            lastSentTimeRef.current = Date.now();
+            setSending(false);
         }
-    };
+    }, [page, pageId, selected, customers, manualBody, manualMedia, say]);
 
-    // Filter pages by search
-    const filteredPages = pages.filter((p) => {
-        if (!pageSearch.trim()) return true;
-        const q = pageSearch.toLowerCase();
-        return p.name.toLowerCase().includes(q) || p.pageId.includes(q);
-    });
+    const goto = useCallback((pid: string, s: Screen) => {
+        setPageId(pid);
+        setScreen(s);
+    }, []);
 
-    // Get selected page name
-    const selectedPageName = pages.find((p) => p.pageId === selectedPageId)?.name || "";
-
-    // Time formatter
-    const formatTime = (iso: string) => {
-        if (!iso) return "";
-        try {
-            const d = new Date(iso);
-            return d.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric" });
-        } catch { return iso; }
-    };
-
-    const successCount = sendResults?.filter((r) => r.success).length || 0;
-    const failCount = sendResults ? sendResults.length - successCount : 0;
-
-    // Batch progress UI helper (guard chia 0 → NaN%)
-    const progressPercent = batchProgress && batchProgress.total > 0
-        ? Math.round((batchProgress.sent / batchProgress.total) * 100)
-        : 0;
+    const NAV: Array<{ key: Screen; label: string; needsPage: boolean }> = [
+        { key: "tong-quan", label: "Tổng quan", needsPage: false },
+        { key: "kich-ban", label: "Kịch bản tự động", needsPage: true },
+        { key: "ban-tay", label: "Bắn tay", needsPage: true },
+    ];
 
     return (
-        <div className="space-y-4">
-
-
-            {/* Header */}
-            <div className="flex items-center justify-between">
-                <div>
-                    <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
-                        <span className="text-xl">📩</span> Gửi Tin Nhắn Hàng Loạt
-                    </h2>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                        Lấy khách từ Pancake POS · Gửi tin qua Facebook Messenger
-                    </p>
-                </div>
-                <div className="flex items-center gap-2 text-[10px] text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5">
-                    <AlertTriangle className="h-3.5 w-3.5" />
-                    HUMAN_AGENT tag · 7 ngày
-                </div>
-            </div>
-
-            {/* Controls Row */}
-            {/* ─── Single control row: Shop + Page + Filters + Button ─── */}
-            <div className="flex items-end gap-2 flex-wrap">
-
-
-                {/* Page Selector */}
-                <div className="relative flex-1 min-w-[180px]">
-                    <label className="text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-1 block">
-                        📄 Chọn Page {pages.length > 0 && <span className="text-violet-500">({pages.length} pages)</span>}
-                    </label>
-                    <div className="relative">
-                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 z-10" />
-                        <input
-                            type="text"
-                            value={isPageDropdownOpen ? pageSearch : (selectedPageId ? `${selectedPageName} (${selectedPageId})` : "")}
-                            onChange={(e) => { setPageSearch(e.target.value); if (!isPageDropdownOpen) setIsPageDropdownOpen(true); }}
-                            onFocus={() => { setIsPageDropdownOpen(true); setPageSearch(""); }}
-                            placeholder={isLoadingPages ? "Đang tải pages..." : "Tìm page theo tên hoặc ID..."}
-                            disabled={isLoadingPages}
-                            className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 pl-9 pr-8 text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:ring-2 focus:ring-violet-400/30 shadow-sm"
-                        />
-                        <ChevronDown className={`absolute right-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 pointer-events-none transition-transform ${isPageDropdownOpen ? "rotate-180" : ""}`} />
-                        {isLoadingPages && <Loader2 className="absolute right-8 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-violet-400 animate-spin" />}
-                    </div>
-                    {isPageDropdownOpen && pages.length > 0 && (
-                        <>
-                            <div className="fixed inset-0 z-20" onClick={() => setIsPageDropdownOpen(false)} />
-                            <div className="absolute z-30 top-full left-0 right-0 mt-1 rounded-xl border border-slate-200 bg-white shadow-xl max-h-[280px] overflow-y-auto">
-                                <button
-                                    onClick={() => { setSelectedPageId(""); setIsPageDropdownOpen(false); setPageSearch(""); setCustomers([]); setSelectedIds(new Set()); setSendResults(null); setFilterActive(false); }}
-                                    className={`w-full text-left px-3 py-2 text-sm hover:bg-violet-50 transition-colors border-b border-slate-100 ${!selectedPageId ? "bg-violet-50 text-violet-700 font-semibold" : "text-slate-600"}`}
-                                >
-                                    Tất cả pages ({pages.length})
-                                </button>
-                                {filteredPages.map((p) => (
-                                    <button
-                                        key={p.pageId}
-                                        onClick={() => { setSelectedPageId(p.pageId); setIsPageDropdownOpen(false); setPageSearch(""); setCustomers([]); setSelectedIds(new Set()); setSendResults(null); setFilterActive(false); }}
-                                        className={`w-full text-left px-3 py-2 text-sm hover:bg-violet-50 transition-colors ${selectedPageId === p.pageId ? "bg-violet-50 text-violet-700 font-semibold" : "text-slate-700"}`}
-                                    >
-                                        <span className="block truncate">
-                                            {p.name}
-                                            {p.source && <span className={`ml-1.5 inline-block px-1.5 py-0 rounded text-[9px] font-medium ${p.source === 'fb_graph' ? 'bg-blue-100 text-blue-600' : p.source === 'crm' ? 'bg-green-100 text-green-600' : 'bg-slate-100 text-slate-500'}`}>{p.source === 'fb_graph' ? 'FB' : p.source === 'crm' ? 'CRM' : 'POS'}</span>}
-                                        </span>
-                                        <span className="block text-[10px] text-slate-400 font-mono">{p.pageId}{p.shopName ? ` · ${p.shopName}` : ''}</span>
-                                    </button>
-                                ))}
-                                {filteredPages.length === 0 && <div className="px-3 py-4 text-sm text-slate-400 text-center">Không tìm thấy page</div>}
-                            </div>
-                        </>
-                    )}
-                </div>
-
-                {/* Filter: Purchase */}
-                <div className="flex-shrink-0">
-                    <label className="text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-1 block">🛒 Trạng thái</label>
-                    <select
-                        value={filterPurchase}
-                        onChange={(e) => { setFilterPurchase(e.target.value as typeof filterPurchase); setFilterActive(false); }}
-                        className="rounded-xl border border-slate-200 bg-white px-2.5 py-2.5 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-violet-300/40 shadow-sm"
-                    >
-                        <option value="all">Tất cả KH</option>
-                        <option value="no_purchase">Nhắn tin chưa mua</option>
-                        <option value="has_purchase">Đã mua hàng</option>
-                    </select>
-                </div>
-
-                {/* Filter: Time */}
-                <div className="flex-shrink-0">
-                    <label className="text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-1 block">📅 Thời gian</label>
-                    <select
-                        value={filterTimeRange}
-                        onChange={(e) => { setFilterTimeRange(e.target.value as typeof filterTimeRange); setFilterActive(false); }}
-                        className="rounded-xl border border-slate-200 bg-white px-2.5 py-2.5 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-violet-300/40 shadow-sm"
-                    >
-                        <option value="all">Trong 7 ngày (cửa sổ gửi)</option>
-                        <option value="24h">24 giờ qua</option>
-                        <option value="7d">7 ngày qua</option>
-                    </select>
-                </div>
-
-                {/* Tuỳ chọn: loại khách vừa tương tác <24h */}
-                <div className="flex-shrink-0">
-                    <label className="text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-1 block">🕐 Chống spam</label>
-                    <label className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-2.5 py-2.5 text-xs text-slate-600 cursor-pointer shadow-sm select-none">
-                        <input
-                            type="checkbox"
-                            checked={excludeRecent24h}
-                            onChange={(e) => setExcludeRecent24h(e.target.checked)}
-                            className="accent-violet-600"
-                        />
-                        Bỏ KH &lt;24h
-                    </label>
-                </div>
-
-                {/* Lọc + Refresh + Count */}
-                <div className="flex items-end gap-2 flex-shrink-0">
-                    <button onClick={() => loadCustomers(selectedShopId, currentPage, selectedPageId)} disabled={(!selectedShopId && !selectedPageId) || isLoadingCustomers} className="rounded-xl border border-slate-200 bg-white p-2.5 text-slate-600 hover:bg-slate-50 transition-colors disabled:opacity-50 shadow-sm">
-                        <RefreshCw className={`h-4 w-4 ${isLoadingCustomers ? "animate-spin" : ""}`} />
-                    </button>
-                    <button onClick={async () => { await loadCustomers(selectedShopId, 1, selectedPageId); setFilterActive(true); }} disabled={(!selectedShopId && !selectedPageId) || isLoadingCustomers} className="rounded-xl bg-gradient-to-r from-violet-600 to-purple-600 px-4 py-2.5 text-xs font-semibold text-white shadow-sm hover:shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap">
-                        🔍 Lọc data
-                    </button>
-                    {filterActive && (
-                        <button onClick={() => { setFilterActive(false); setFilterPurchase('all'); setFilterTimeRange('all'); setFilterGender('all'); }} className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-xs text-slate-500 hover:bg-slate-50 transition-colors shadow-sm">
-                            ✕
-                        </button>
-                    )}
-                    <div className="rounded-xl bg-violet-50 border border-violet-200 px-3 py-2.5 text-sm whitespace-nowrap">
-                        <span className="font-semibold text-violet-700">{selectedIds.size}</span>
-                        <span className="text-violet-500">/{filteredCustomers.length} chọn</span>
-                    </div>
-                </div>
-            </div>
-
-
-
-            {/* CRM Warning Banner */}
-            {crmWarning && (
-                <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 flex items-start gap-3">
-                    <AlertTriangle className="h-5 w-5 text-amber-600 flex-shrink-0 mt-0.5" />
-                    <div className="flex-1">
-                        <p className="text-sm font-semibold text-amber-800">CRM không khả dụng cho page này</p>
-                        <p className="text-xs text-amber-700 mt-1">{crmWarning}</p>
-                        <p className="text-xs text-amber-600 mt-1">
-                            👉 Vào <a href="https://pages.fm" target="_blank" rel="noopener noreferrer" className="underline font-medium hover:text-amber-800">pages.fm</a> → Đăng nhập lại Facebook → Quay lại đây và bấm 🔍 Lọc data
-                        </p>
-                    </div>
-                    <button onClick={() => setCrmWarning(null)} className="text-amber-500 hover:text-amber-700">
-                        <X className="h-4 w-4" />
-                    </button>
-                </div>
-            )}
-
-            {/* Customer List */}
-            <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
-                {/* Header */}
-                <div className="grid grid-cols-[80px_1fr_120px_80px_100px] gap-2 px-4 py-2.5 bg-slate-50 border-b border-slate-100 text-[10px] font-semibold text-slate-500 uppercase tracking-wider items-center">
-                    <button onClick={toggleSelectAll} className="flex items-center gap-1.5 px-1 py-0.5 rounded hover:bg-violet-50 transition-colors" title={`Chọn tất cả ${filteredCustomers.length} khách trong bộ lọc`}>
-                        {selectedIds.size === filteredCustomers.length && filteredCustomers.length > 0
-                            ? <CheckSquare className="h-4 w-4 text-violet-600 flex-shrink-0" />
-                            : <Square className="h-4 w-4 text-slate-400 flex-shrink-0" />
-                        }
-                        <span className="text-[10px] font-semibold text-violet-600 whitespace-nowrap">Tất cả</span>
-                    </button>
-                    <span>Khách hàng</span>
-                    <span>SĐT</span>
-                    <span className="text-center">Tin nhắn</span>
-                    <span className="text-right">Ngày</span>
-                </div>
-
-                {/* Loading */}
-                {isLoadingCustomers && (
-                    <div className="flex items-center justify-center py-12 text-sm text-slate-400">
-                        <Loader2 className="h-5 w-5 animate-spin mr-2" />
-                        Đang tải danh sách khách...
-                    </div>
-                )}
-
-                {/* Empty */}
-                {!isLoadingCustomers && filteredCustomers.length === 0 && selectedShopId && customers.length > 0 && (
-                    <div className="flex flex-col items-center justify-center py-12 text-sm text-slate-400">
-                        <Filter className="h-8 w-8 mb-2 text-slate-300" />
-                        Không có khách phù hợp bộ lọc
-                    </div>
-                )}
-
-                {!isLoadingCustomers && customers.length === 0 && (
-                    <div className="flex flex-col items-center justify-center py-12 text-sm text-slate-400">
-                        <Users className="h-8 w-8 mb-2 text-slate-300" />
-                        {selectedPageId ? "Không có khách nào từ page này" : "Chọn page và bấm 🔍 Lọc data để xem khách hàng"}
-                    </div>
-                )}
-
-                <div className="max-h-[400px] overflow-y-auto divide-y divide-slate-50">
-                    {filteredCustomers.slice(0, visibleCount).map((c) => {
-                        const isSelected = selectedIds.has(c.id);
-                        const result = sendResults?.find((r) => r.psid === c.psid);
-                        const name = c.customerName || "Không rõ tên";
-                        const phone = c.customerPhone || "";
-                        const msgs = c.messageCount || c.orderCount || 0;
-                        const sub = (c.snippet || c.address || "").replace(/[\r\n]+/g, " ").slice(0, 80);
-
-                        return (
-                            <div
-                                key={c.id}
-                                className={`grid grid-cols-[80px_1fr_120px_80px_100px] gap-2 px-4 py-2.5 items-center cursor-pointer hover:bg-slate-50/80 transition-colors ${
-                                    isSelected ? "bg-violet-50/50" : ""
-                                } ${
-                                    result?.success ? "!bg-green-50/50" : result && !result.success ? "!bg-red-50/50" : ""
-                                }`}
-                                onClick={() => toggleSelect(c.id)}
-                            >
-                                {/* Checkbox */}
-                                <div className="flex items-center justify-center">
-                                    {result ? (
-                                        result.success
-                                            ? <CheckCircle2 className="h-4 w-4 text-green-500" />
-                                            : <XCircle className="h-4 w-4 text-red-500" />
-                                    ) : isSelected
-                                        ? <CheckSquare className="h-4 w-4 text-violet-600" />
-                                        : <Square className="h-4 w-4 text-slate-300" />
-                                    }
-                                </div>
-
-                                {/* Name */}
-                                <div className="min-w-0">
-                                    <div className="flex items-center gap-1.5">
-                                        <p className="text-sm font-medium text-slate-700 truncate">{name}</p>
-                                        {c.conversationLink && (
-                                            <a
-                                                href={c.conversationLink}
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                                onClick={(e) => e.stopPropagation()}
-                                                className="text-violet-400 hover:text-violet-600"
-                                                title="Mở Pancake"
-                                            >
-                                                <ExternalLink className="h-3 w-3" />
-                                            </a>
-                                        )}
-                                    </div>
-                                    {sub && (
-                                        <p className="text-[10px] text-slate-400 truncate max-w-[300px]">{sub}</p>
-                                    )}
-                                </div>
-
-                                {/* Phone */}
-                                <div className="flex items-center gap-1 text-xs text-slate-500">
-                                    {phone && <Phone className="h-3 w-3 text-slate-400" />}
-                                    <span className="truncate">{phone || "—"}</span>
-                                </div>
-
-                                {/* Messages */}
-                                <div className="flex items-center justify-center gap-1 text-xs">
-                                    <MessageSquare className="h-3 w-3 text-slate-400" />
-                                    <span className={msgs > 0 ? "text-blue-600 font-semibold" : "text-slate-400"}>
-                                        {msgs}
-                                    </span>
-                                </div>
-
-                                {/* Date */}
-                                <p className="text-[11px] text-slate-400 text-right">{formatTime(c.updatedAt || "")}</p>
-                            </div>
-                        );
-                    })}
-                    {filteredCustomers.length > visibleCount && (
-                        <button
-                            onClick={() => setVisibleCount(prev => prev + 200)}
-                            className="w-full py-2.5 text-center text-xs font-medium text-violet-600 hover:bg-violet-50 transition-colors"
+        <div className="min-h-screen">
+            {/* ─── Thanh trên cùng ─────────────────────────────────────── */}
+            <header
+                className="sticky top-0 z-30 border-b"
+                style={{ background: "var(--card)", borderColor: "var(--line)" }}
+            >
+                <div className="mx-auto flex max-w-[1440px] flex-wrap items-center gap-x-6 gap-y-2 px-5 py-2.5">
+                    <div className="flex items-center gap-2">
+                        <span
+                            className="flex h-7 w-7 items-center justify-center rounded-lg text-[13px] font-bold"
+                            style={{ background: "var(--brand)", color: "var(--brand-ink)" }}
                         >
-                            Xem thêm ({filteredCustomers.length - visibleCount} còn lại)
-                        </button>
-                    )}
-                </div>
-
-                {/* Total count */}
-                {filteredCustomers.length > 0 && (
-                    <div className="flex items-center justify-center px-4 py-2 bg-slate-50 border-t border-slate-100">
-                        <span className="text-xs text-slate-400">
-                            Hiển thị: {Math.min(visibleCount, filteredCustomers.length)} · Lọc: {filteredCustomers.length} · Tổng CRM: {totalCustomers} khách · Đã chọn: {selectedIds.size}
-                            {outsideWindowCount > 0 && (
-                                <span className="text-amber-500"> · Ẩn {outsideWindowCount} khách ngoài cửa sổ 7 ngày (gửi sẽ lỗi #10)</span>
-                            )}
+                            B
                         </span>
+                        <span className="text-[14.5px] font-bold tracking-tight">Bắn bot TALPHA</span>
                     </div>
-                )}
-            </div>
 
-            {/* Message Composer - 4 Boxes */}
-            <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm space-y-4">
-                <div className="flex items-center justify-between">
-                    <label className="text-sm font-bold text-slate-700 flex items-center gap-2">
-                        ✏️ Soạn tin nhắn broadcast
-                    </label>
-                    <span className="text-[11px] text-slate-400 bg-slate-50 px-2 py-1 rounded-full">
-                        {totalMediaCount} media · {selectedIds.size} người nhận
-                    </span>
-                </div>
-
-                {/* Lưới 12 ô: 3 cụm × 4 khung giờ */}
-                <div className="space-y-4">
-                    {Array.from({ length: SLOT_COUNT }, (_, idx) => {
-                        const cum = Math.floor(idx / SLOT_HOURS.length);
-                        const slot = idx % SLOT_HOURS.length;
-                        const color = (['emerald', 'blue', 'violet', 'rose'] as const)[slot];
-                        const hour = `${SLOT_HOURS[slot]}:00`;
-                        const label = `TIN ${idx + 1} · ${CUM_LABELS[cum]}`;
-                        const placeholder = [
-                            'Chào + trả lời ngay câu khách hay hỏi nhất…',
-                            'Báo giá, phí ship, hình thức thanh toán…',
-                            'Công dụng chính, nối tiếp lời hứa của quảng cáo…',
-                            'Cách dùng / cách đặt hàng…',
-                            'Ảnh hoặc lời khách đã mua…',
-                            'Gỡ băn khoăn phổ biến nhất…',
-                            'Gỡ băn khoăn thứ hai…',
-                            'Cam kết: kiểm hàng trước khi trả tiền…',
-                            'Ưu đãi có hạn…',
-                            'Khan hàng, giữ chỗ…',
-                            'Hỏi thẳng để lấy tên + SĐT + địa chỉ…',
-                            'Tin cuối, để ngỏ cửa quay lại…',
-                        ][idx] ?? '';
-                        return { idx, label, color, hour, placeholder };
-                    }).map(({ idx, label, color, hour, placeholder }) => {
-                        const boxMedia = mediaArrays[idx];
-                        const boxMsg = messages[idx];
-                        const setMsg = (v: string) => setMessageAt(idx, v);
-                        const colorMap: Record<string, Record<string, string>> = {
-                            emerald: { border: 'border-emerald-100', bg: 'bg-emerald-50/20', badge: 'bg-emerald-500', text: 'text-emerald-600', mediaBorder: 'border-emerald-200', inputBorder: 'border-emerald-100', ring: 'focus:ring-emerald-300/30', uploadBorder: 'border-emerald-200 hover:border-emerald-400', uploadBg: 'hover:bg-emerald-50', uploadText: 'text-emerald-400' },
-                            blue: { border: 'border-blue-100', bg: 'bg-blue-50/20', badge: 'bg-blue-500', text: 'text-blue-600', mediaBorder: 'border-blue-200', inputBorder: 'border-blue-100', ring: 'focus:ring-blue-300/30', uploadBorder: 'border-blue-200 hover:border-blue-400', uploadBg: 'hover:bg-blue-50', uploadText: 'text-blue-400' },
-                            violet: { border: 'border-violet-100', bg: 'bg-violet-50/20', badge: 'bg-violet-500', text: 'text-violet-600', mediaBorder: 'border-violet-200', inputBorder: 'border-violet-100', ring: 'focus:ring-violet-300/30', uploadBorder: 'border-violet-200 hover:border-violet-400', uploadBg: 'hover:bg-violet-50', uploadText: 'text-violet-400' },
-                            rose: { border: 'border-rose-100', bg: 'bg-rose-50/20', badge: 'bg-rose-500', text: 'text-rose-600', mediaBorder: 'border-rose-200', inputBorder: 'border-rose-100', ring: 'focus:ring-rose-300/30', uploadBorder: 'border-rose-200 hover:border-rose-400', uploadBg: 'hover:bg-rose-50', uploadText: 'text-rose-400' },
-                        };
-                        const c = colorMap[color];
-                        return (
-                            <div key={idx} className={`rounded-lg border ${c.border} ${c.bg} p-3 space-y-2`}>
-                                <div className="flex items-center justify-between">
-                                    <label className={`text-[11px] font-semibold ${c.text} flex items-center gap-1.5`}>
-                                        <span className={`w-5 h-5 rounded-full ${c.badge} text-white flex items-center justify-center text-[10px] font-bold`}>{idx + 1}</span>
-                                        {label}
-                                    </label>
-                                    <span className="text-[10px] text-slate-400 bg-white/70 px-1.5 py-0.5 rounded">⏰ {hour}</span>
-                                </div>
-                                {/* Side-by-side: Media Left, Text Right */}
-                                <div className="flex gap-3">
-                                    {/* Media Gallery - Left */}
-                                    <div className="flex-shrink-0" style={{ minWidth: '20%', maxWidth: '33%' }}>
-                                        <div className="flex gap-1.5 flex-wrap">
-                                            {boxMedia.map((src, mi) => (
-                                                <div key={mi} className="relative group flex-shrink-0">
-                                                    {src.startsWith('data:video') ? (
-                                                        <video src={src} className={`w-14 h-14 rounded-lg object-cover border ${c.mediaBorder}`} muted />
-                                                    ) : (
-                                                        <img src={src} alt="" className={`w-14 h-14 rounded-lg object-cover border ${c.mediaBorder}`} />
-                                                    )}
-                                                    <button onClick={() => removeMedia(idx, mi)} className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100 transition-opacity shadow"><X className="h-2.5 w-2.5" /></button>
-                                                </div>
-                                            ))}
-                                            <label className={`w-14 h-14 flex-shrink-0 rounded-lg border-2 border-dashed ${c.uploadBorder} bg-white/50 ${c.uploadBg} flex flex-col items-center justify-center cursor-pointer transition-colors gap-0.5`}>
-                                                <ImagePlus className={`h-3.5 w-3.5 ${c.uploadText}`} />
-                                                <span className={`text-[7px] ${c.uploadText}`}>+Ảnh/Video</span>
-                                                <input type="file" accept="image/*,video/*" multiple onChange={handleMediaUpload(idx)} className="hidden" />
-                                            </label>
-                                        </div>
-                                    </div>
-                                    {/* Text - Right */}
-                                    <textarea
-                                        value={boxMsg}
-                                        onChange={(e) => setMsg(e.target.value)}
-                                        onPaste={handlePaste(idx)}
-                                        onDrop={handleDrop(idx)}
-                                        onDragOver={(e) => e.preventDefault()}
-                                        placeholder={uploadingBox === idx ? "Đang tải ảnh lên…" : placeholder}
-                                        rows={5}
-                                        className={`flex-1 min-w-0 rounded-lg border ${c.inputBorder} bg-white px-3 py-2 text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:ring-2 ${c.ring} resize-none`}
-                                    />
-                                </div>
-                            </div>
-                        );
-                    })}
-                </div>
-
-                {/* ═══ BOX LỚN: Hẹn giờ bắn bot + Tiến trình bắn ═══ */}
-                <div className="rounded-xl border-2 border-amber-200 bg-gradient-to-br from-amber-50/40 to-orange-50/20 p-4 space-y-3 shadow-sm">
-
-                    {/* ── ⏰ Hẹn giờ bắn bot ── */}
-                    <div className="space-y-2">
-                        <div className="flex items-center justify-between">
-                            <label className="text-[11px] font-semibold text-amber-700 flex items-center gap-1.5">
-                                <CalendarClock className="h-4 w-4" />
-                                Hẹn giờ bắn bot · {shopTz.flag} {shopName} ({shopTz.label}, UTC+{shopTz.offset})
-                            </label>
-                            <span className="text-[10px] text-amber-500 flex items-center gap-1">
-                                <Clock className="h-3 w-3" />
-                                Giờ hiện tại: {getCurrentTimeInTimezone(shopTz.offset)}
-                            </span>
-                        </div>
-                        <div className="grid grid-cols-5 gap-2">
-                            {/* ── Cột trái: 3 nút hành động ── */}
-                            <div className="relative flex flex-col gap-1">
-                                <div className="relative">
-                                    <button
-                                        disabled={isSending || selectedIds.size === 0}
-                                        onClick={() => setSendDropdownOpen(prev => !prev)}
-                                        className="w-full rounded-lg px-2 py-2.5 text-center transition-all border-2 border-red-300 bg-gradient-to-b from-red-500 to-orange-500 text-white shadow-md shadow-red-200 hover:shadow-red-300 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed text-sm font-bold"
-                                    >
-                                        ⚡ Bắn ngay ▾
-                                    </button>
-                                    {sendDropdownOpen && !isSending && (
-                                        <div className="absolute top-full left-0 right-0 z-50 mt-1 bg-white rounded-lg shadow-xl border border-gray-200 overflow-hidden">
-                                            {[0,1,2,3].map(i => (
-                                                <button
-                                                    key={i}
-                                                    onClick={() => {
-                                                        setSendDropdownOpen(false);
-                                                        if (!sendingLockRef.current) handleSendBox(i);
-                                                    }}
-                                                    disabled={selectedIds.size === 0}
-                                                    className="w-full px-3 py-2 text-left text-sm hover:bg-red-50 hover:text-red-600 transition-colors disabled:opacity-40"
-                                                >
-                                                    Đoạn {i+1}
-                                                </button>
-                                            ))}
-                                        </div>
-                                    )}
-                                </div>
-
+                    <nav className="flex gap-1">
+                        {NAV.map((n) => {
+                            const disabled = n.needsPage && !pageId;
+                            const on = screen === n.key;
+                            return (
                                 <button
-                                    onClick={() => {
-                                        // Chỉ abort — handleSendBox tự dọn lock/kết quả trong finally,
-                                        // không cưỡng chế mở khoá ở đây để tránh lệch trạng thái
-                                        if (abortControllerRef.current) {
-                                            abortControllerRef.current.abort();
-                                            showToast("⛔ Đang huỷ gửi...");
-                                        }
-                                    }}
-                                    disabled={!isSending}
-                                    className="w-full rounded-lg px-2 py-1.5 text-center transition-all border-2 border-red-400 bg-red-50 text-red-700 text-[11px] font-bold hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                                    key={n.key}
+                                    disabled={disabled}
+                                    onClick={() => setScreen(n.key)}
+                                    title={disabled ? "Chọn một page trước" : undefined}
+                                    className="rounded-lg px-3 py-1.5 text-[13.5px] font-semibold disabled:opacity-40"
+                                    style={
+                                        on
+                                            ? { background: "var(--brand-soft)", color: "var(--brand)" }
+                                            : { color: "var(--ink-2)" }
+                                    }
                                 >
-                                    ⛔ Huỷ bắn
+                                    {n.label}
                                 </button>
-                            </div>
-                            {/* ── Cột phải: Accordion 4 khung giờ ── */}
-                            <div className="col-span-4 flex flex-col gap-2">
-                                {/* Toggle header – click để mở/đóng */}
-                                <button
-                                    onClick={() => setShowSchedulePreview(p => !p)}
-                                    className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border-2 border-amber-200 bg-white/90 hover:bg-amber-50 transition-colors"
-                                >
-                                    <span className="flex items-center gap-2 text-[11px] font-semibold text-amber-700">
-                                        <CalendarClock className="h-3.5 w-3.5" />
-                                        Lịch hẹn giờ
-                                        <span className="px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-bold">
-                                            {messages.filter(m => m?.trim()).length + mediaArrays.filter(a => a.length > 0).length} đoạn sẵn sàng
-                                        </span>
-                                    </span>
-                                    <ChevronDown className={`h-4 w-4 text-amber-500 transition-transform duration-200 ${showSchedulePreview ? 'rotate-180' : ''}`} />
-                                </button>
-                                {/* Collapsible: 4 ô giờ */}
-                                {showSchedulePreview && (
-                                    <>
-                                    <div className="grid grid-cols-4 gap-1.5">
-                                        {[0,1,2,3].map(i => {
-                                            const hour = SEGMENT_HOUR_MAP[i];
-                                            const hasFill = !!(messages[i]?.trim() || mediaArrays[i]?.length > 0);
-                                            const isScheduled = scheduledSegments.has(i);
-                                            return (
-                                                <div
-                                                    key={i}
-                                                    className={`rounded-lg border-2 px-2 py-2.5 text-center transition-all ${
-                                                        isScheduled && hasFill
-                                                            ? "border-green-400 bg-green-50 text-green-800 shadow-sm"
-                                                            : hasFill
-                                                            ? "border-amber-400 bg-amber-50 text-amber-800 shadow-sm"
-                                                            : "border-dashed border-slate-200 bg-white/60 text-slate-300"
-                                                    }`}
-                                                >
-                                                    <div className="text-base font-bold">{hour}:00</div>
-                                                    <div className="text-[9px] mt-0.5">{SCHEDULE_LABELS[hour]}</div>
-                                                    <div className={`text-[9px] font-semibold mt-1 ${
-                                                        isScheduled && hasFill ? "text-green-600" : hasFill ? "text-amber-600" : "text-slate-300"
-                                                    }`}>
-                                                        {isScheduled && hasFill ? `✅ Đã hẹn · Đoạn ${i+1}` : hasFill ? `● Đoạn ${i+1}` : `○ Đoạn ${i+1}`}
-                                                    </div>
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                    <button
-                                        onClick={handleScheduleAll}
-                                        disabled={(!selectedShopId && !selectedPageId) || messages.every(m => !m?.trim())}
-                                        className="w-full rounded-lg px-3 py-2.5 text-center transition-all border-2 border-amber-400 bg-gradient-to-r from-amber-500 to-orange-400 text-white shadow-md shadow-amber-200 hover:shadow-amber-300 font-bold text-sm disabled:opacity-40 disabled:cursor-not-allowed"
-                                    >
-                                        ⏰ Hẹn lịch ({messages.filter(m => m?.trim()).length} đoạn)
-                                    </button>
-                                    </>
-                                )}
-                            </div>
-                        </div>
-                    </div>
+                            );
+                        })}
+                    </nav>
 
-                    {/* ── 📊 Tiến trình gửi tin ── */}
-                    <div className="border-t border-amber-200/60 pt-3 space-y-2">
-                        <div className="flex items-center justify-between text-sm font-semibold">
-                            <span className="text-blue-700 flex items-center gap-1.5">
-                                {batchCountdown > 0 ? (
-                                    <><span className="animate-pulse">⏸️</span> Nghỉ giữa đợt... ({batchCountdown}s)</>
-                                ) : batchProgress && batchProgress.sent < batchProgress.total ? (
-                                    <><span className="animate-pulse">📡</span> Đang gửi...{autoBatchInfo ? ` (Đợt ${autoBatchInfo.currentBatch}/${autoBatchInfo.totalBatches})` : ''}</>
-                                ) : sendingLog.length > 0 && sendingLog.every(l => l.status === 'success' || l.status === 'error') ? (
-                                    <>✅ Hoàn tất</>
-                                ) : (
-                                    <>📊 Tiến trình gửi tin</>
-                                )}
-                            </span>
-                            <div className="flex items-center gap-3 text-xs">
-                                {sendingLog.length > 0 && (
-                                    <>
-                                        <span className="text-green-600">✅ {sendingLog.filter(l => l.status === 'success').length}</span>
-                                        <span className="text-red-500">❌ {sendingLog.filter(l => l.status === 'error').length}</span>
-                                        <span className="text-amber-500">⏳ {sendingLog.filter(l => l.status === 'pending' || l.status === 'sending').length}</span>
-                                    </>
-                                )}
-                                <span className="text-blue-600 font-medium">
-                                    {batchProgress ? `${batchProgress.sent}/${batchProgress.total} · ${progressPercent}%` : sendingLog.length > 0 ? '100%' : 'Chờ gửi'}
-                                </span>
-                            </div>
-                        </div>
-                        <div className={`w-full rounded-full h-3 overflow-hidden transition-colors duration-500 ${
-                            progressPercent >= 100 && sendingLog.length > 0 ? 'bg-green-100' : 'bg-blue-100'
-                        }`}>
-                            <div
-                                className={`h-3 rounded-full transition-all duration-500 ease-out ${
-                                    !batchProgress && sendingLog.length === 0 ? 'bg-slate-200' :
-                                    progressPercent >= 100 ? 'bg-gradient-to-r from-green-400 to-emerald-500' : 'bg-gradient-to-r from-blue-500 to-indigo-500'
-                                }`}
-                                style={{ width: `${(!batchProgress && sendingLog.length === 0) ? 0 : progressPercent}%` }}
-                            />
-                        </div>
-                        {sendingLog.length > 0 ? (
-                            <div ref={logScrollRef} className="max-h-36 overflow-y-auto space-y-0.5 rounded-lg bg-white/70 border border-blue-100 p-2">
-                                {sendingLog.map((log, idx) => (
-                                    <div key={idx} className={`flex items-center gap-2 px-2 py-0.5 rounded text-[11px] transition-colors ${
-                                        log.status === 'sending' ? 'bg-blue-50 text-blue-700 font-medium' :
-                                        log.status === 'success' ? 'text-green-700' :
-                                        log.status === 'error' ? 'text-red-600' :
-                                        'text-slate-400'
-                                    }`}>
-                                        <span className="flex-shrink-0 w-4 text-center">
-                                            {log.status === 'pending' && '⏳'}
-                                            {log.status === 'sending' && <span className="animate-spin inline-block">⏳</span>}
-                                            {log.status === 'success' && '✅'}
-                                            {log.status === 'error' && '❌'}
-                                        </span>
-                                        <span className="truncate flex-1">{idx + 1}. {log.name}</span>
-                                        {sendResults && sendResults[idx]?.via === 'fb_graph_api' && (
-                                            <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[8px] font-bold bg-blue-100 text-blue-700 border border-blue-200">FB</span>
-                                        )}
-                                        {log.error && <span className="text-red-400 text-[10px] truncate max-w-[250px]" title={log.error}>{log.error}</span>}
-                                    </div>
-                                ))}
-                            </div>
-                        ) : (
-                            <div className="rounded-lg bg-white/50 border border-blue-100/50 p-2.5 text-center text-[11px] text-slate-300">
-                                Chờ gửi tin nhắn...
-                            </div>
-                        )}
-                    </div>
-                </div>
-            </div>
-
-            {/* ─── Toast notification ──────────────────────────────────────────── */}
-            <AnimatePresence>
-                {scheduleToast && (
-                    <motion.div
-                        initial={{ opacity: 0, y: -8 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -8 }}
-                        className="rounded-xl border border-violet-200 bg-violet-50 px-4 py-3 text-sm font-medium text-violet-800 shadow-sm"
-                    >
-                        {scheduleToast}
-                    </motion.div>
-                )}
-            </AnimatePresence>
-
-            {/* ─── Schedule List ──────────────────────────────────────────────── */}
-            {schedules.length > 0 && (
-                <div className="space-y-3">
-                    <div className="flex items-center justify-between">
-                        <h3 className="text-sm font-bold text-slate-700 flex items-center gap-2">
-                            <CalendarClock className="h-4 w-4 text-violet-500" />
-                            Lịch bắn bot hàng ngày
-                            <span className="text-[11px] font-normal text-slate-400">({schedules.length} lịch)</span>
-                        </h3>
-                        <button
-                            onClick={async () => {
-                                if (!confirm(`⚠️ Xoá TẤT CẢ ${schedules.length} lịch bắn bot?\n\nHành động này không hoàn tác được.`)) return;
-                                for (const s of schedules) { await deleteScheduleFromAPI(s.id); }
-                                refreshSchedules();
-                            }}
-                            className="text-[10px] text-red-400 hover:text-red-600 transition-colors"
+                    <div className="ml-auto flex items-center gap-2.5">
+                        <select
+                            className="field max-w-[280px] !w-auto !py-1.5 !text-[13px]"
+                            value={pageId}
+                            onChange={(e) => setPageId(e.target.value)}
                         >
-                            Xoá tất cả
-                        </button>
+                            <option value="">— Chọn page —</option>
+                            {pages.map((p) => (
+                                <option key={p.pageId} value={p.pageId}>
+                                    {p.name} ({num(p.activeCustomers)})
+                                </option>
+                            ))}
+                        </select>
+                        {page && <PageStateChip p={page} />}
                     </div>
+                </div>
 
-                    {/* ─── Stats Dashboard ───────────────────────────────────── */}
-                    {(() => {
-                        const allSegs = schedules.flatMap(s => s.segments || []);
-                        const totalSent = allSegs.reduce((a, seg) => a + (seg.successCount || 0), 0);
-                        const totalRecipients = allSegs.reduce((a, seg) => a + (seg.totalRecipients || 0), 0);
-                        const totalErrors = allSegs.reduce((a, seg) => a + (seg.errorCount || 0), 0);
-                        const successRate = totalRecipients > 0 ? ((totalSent / totalRecipients) * 100) : 0;
-                        const errorRate = totalRecipients > 0 ? ((totalErrors / totalRecipients) * 100) : 0;
-                        const activeCampaigns = schedules.filter(s => s.isActive).length;
-                        const totalDataQueued = schedules.reduce((a, s) => a + (s.recipientCount || 0), 0);
+                {/* Thanh ngữ cảnh: luôn thấy đang làm việc với page nào */}
+                {page && (
+                    <div
+                        className="border-t px-5 py-2"
+                        style={{ background: "var(--card-2)", borderColor: "var(--line-soft)" }}
+                    >
+                        <div className="mx-auto flex max-w-[1440px] flex-wrap items-center gap-x-5 gap-y-1 text-[12.5px]">
+                            <span className="font-semibold">{page.name}</span>
+                            <span style={{ color: "var(--ink-3)" }}>{page.shopName}</span>
+                            <span className="num" style={{ color: "var(--ink-2)" }}>
+                                <b>{num(page.activeCustomers)}</b> khách gửi được
+                                <span style={{ color: "var(--ink-3)" }}> / {num(page.totalCustomers)} trong tệp</span>
+                            </span>
+                            {!page.hasScript && <Chip kind="warn">chưa có kịch bản</Chip>}
+                            {page.isActive && page.rampPercent < 100 && (
+                                <Chip kind="warn">khởi động dần {page.rampPercent}%</Chip>
+                            )}
+                            <span className="ml-auto" style={{ color: "var(--ink-3)" }}>
+                                đồng bộ {ago(page.lastSyncedAt ?? "")}
+                            </span>
+                        </div>
+                    </div>
+                )}
+            </header>
 
-                        return (
-                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-2">
-                                {/* Card 1: Tổng tin đã gửi */}
-                                <div className="bg-white rounded-xl border border-slate-100 p-3 shadow-sm">
-                                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Tổng tin đã gửi</p>
-                                    <div className="flex items-end gap-2">
-                                        <span className="text-2xl font-bold text-slate-800">{totalSent.toLocaleString()}</span>
-                                        {totalRecipients > 0 && (
-                                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 ${
-                                                successRate >= 70 ? 'bg-green-50 text-green-600' : 'bg-amber-50 text-amber-600'
-                                            }`}>
-                                                {successRate >= 70 ? '↗' : '↘'}{successRate.toFixed(0)}%
-                                            </span>
-                                        )}
-                                    </div>
-                                </div>
-                                {/* Card 2: Data chờ bắn */}
-                                <div className="bg-white rounded-xl border border-slate-100 p-3 shadow-sm">
-                                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Data chờ bắn</p>
-                                    <div className="flex items-end gap-2">
-                                        <span className="text-2xl font-bold text-slate-800">{totalDataQueued.toLocaleString()}</span>
-                                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 bg-indigo-50 text-indigo-600">
-                                            👥 {schedules.length} page
-                                        </span>
-                                    </div>
-                                </div>
-                                {/* Card 3: Chiến dịch đang chạy */}
-                                <div className="bg-white rounded-xl border border-slate-100 p-3 shadow-sm">
-                                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Chiến dịch chạy</p>
-                                    <div className="flex items-end gap-2">
-                                        <span className="text-2xl font-bold text-slate-800">{activeCampaigns}</span>
-                                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 bg-green-50 text-green-600">
-                                            Active
-                                        </span>
-                                    </div>
-                                </div>
-                                {/* Card 4: Tỷ lệ lỗi */}
-                                <div className="bg-white rounded-xl border border-slate-100 p-3 shadow-sm">
-                                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Tỷ lệ lỗi</p>
-                                    <div className="flex items-end gap-2">
-                                        <span className="text-2xl font-bold text-slate-800">{errorRate.toFixed(2)}%</span>
-                                        {totalErrors > 0 && (
-                                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 bg-red-50 text-red-500">
-                                                ↗{totalErrors}
-                                            </span>
-                                        )}
-                                        {totalErrors === 0 && totalRecipients > 0 && (
-                                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full mb-1 bg-green-50 text-green-600">
-                                                ✓ Clean
-                                            </span>
-                                        )}
-                                    </div>
-                                </div>
-                            </div>
-                        );
-                    })()}
+            <main className="mx-auto max-w-[1440px] px-5 py-5">
+                {screen === "tong-quan" && (
+                    <OverviewScreen pages={pages} loading={loadingPages} onPick={goto} />
+                )}
 
-                    {schedules.map(s => {
-                        const tz = SHOP_TIMEZONES[s.shopName];
-                        const nextMs = s.nextFireAt ? new Date(s.nextFireAt).getTime() - Date.now() : null;
-                        const isEditing = editingScheduleId === s.id;
-                        // Lấy danh sách segments (backward compat: nếu chưa có thì tạo từ hour/messages)
-                        const segs: ScheduleSegment[] = s.segments || [{ segIdx: 0, hour: s.hour, message: s.messages[0] || '' }];
-                        const segHours = segs.map(seg => `${seg.hour}h`).join(', ');
-                        return (
-                            <div key={s.id} className={`rounded-xl border p-3 space-y-2 transition-colors ${
-                                s.isActive ? "border-violet-200 bg-violet-50/40" : "border-slate-200 bg-slate-50/60"
-                            }`}>
-                                {/* Row 1: Actions (left) + Info (right) */}
-                                <div className="flex items-start gap-3">
-                                    <div className="flex flex-col gap-1 flex-shrink-0 pt-0.5">
-                                        <div className="relative">
-                                            <button
-                                                onClick={() => setFireNowId(fireNowId === s.id ? null : s.id)}
-                                                disabled={!!firingSegKey}
-                                                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold bg-orange-500 text-white hover:bg-orange-600 transition-colors disabled:opacity-50 w-full justify-center"
-                                            >
-                                                {firingSegKey?.startsWith(s.id + "_")
-                                                    ? <><Loader2 className="h-3 w-3 animate-spin" /> Đang bắn</>
-                                                    : <><Zap className="h-3 w-3" /> Bắn ngay</>}
-                                            </button>
-                                            {fireNowId === s.id && !firingSegKey && (
-                                                <div className="absolute left-0 top-full mt-1 z-20 bg-white rounded-lg shadow-lg border border-orange-200 p-1.5 w-40 space-y-1">
-                                                    <div className="text-[10px] font-semibold text-slate-500 px-1 pb-0.5">Chọn đoạn để bắn:</div>
-                                                    {segs
-                                                        .filter(seg => (seg.message || "").trim() || (seg.media && seg.media.length))
-                                                        .map(seg => (
-                                                            <button
-                                                                key={seg.segIdx}
-                                                                onClick={() => handleFireNow(s, seg.segIdx, seg.hour)}
-                                                                className="flex items-center gap-1 w-full text-left px-2 py-1 rounded-md text-[11px] font-medium bg-orange-50 text-orange-700 hover:bg-orange-100 transition-colors"
-                                                            >
-                                                                <Zap className="h-3 w-3 flex-shrink-0" />
-                                                                {SCHEDULE_LABELS[seg.hour] || `${seg.hour}h`}
-                                                            </button>
-                                                        ))}
-                                                </div>
-                                            )}
-                                        </div>
-                                        {(() => {
-                                            const isFiringThis = firingSegKey?.startsWith(s.id + "_");
-                                            return (
-                                                <button
-                                                    onClick={handleCancelFire}
-                                                    disabled={!isFiringThis}
-                                                    className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold transition-colors w-full justify-center ${
-                                                        isFiringThis
-                                                            ? "bg-red-500 text-white hover:bg-red-600 animate-pulse"
-                                                            : "bg-red-50 text-red-300 cursor-not-allowed"
-                                                    }`}
-                                                    title={isFiringThis ? "Dừng đợt đang gửi" : "Chỉ bấm được khi đang bắn"}
-                                                >
-                                                    <X className="h-3 w-3" /> Huỷ bắn
-                                                </button>
-                                            );
-                                        })()}
-                                        <button
-                                            onClick={() => toggleScheduleActive(s.id)}
-                                            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold transition-colors ${
-                                                s.isActive
-                                                    ? "bg-yellow-100 text-yellow-700 hover:bg-yellow-200"
-                                                    : "bg-green-100 text-green-700 hover:bg-green-200"
-                                            }`}
-                                        >
-                                            {s.isActive ? <><Timer className="h-3 w-3" /> Dừng</> : <><Clock className="h-3 w-3" /> Chạy</>}
-                                        </button>
-                                        <button onClick={() => startEditNote(s)} className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold bg-blue-50 text-blue-500 hover:bg-blue-100 transition-colors">
-                                            <MessageSquare className="h-3 w-3" /> Ghi chú
-                                        </button>
-                                        <button onClick={() => handleEditScheduleContent(s)} className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold bg-amber-50 text-amber-600 hover:bg-amber-100 transition-colors">
-                                            <Pencil className="h-3 w-3" /> Sửa
-                                        </button>
-                                        <button onClick={() => handleDeleteSchedule(s.id)} className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold bg-red-50 text-red-400 hover:bg-red-100 transition-colors">
-                                            <X className="h-3 w-3" /> Xoá
-                                        </button>
-                                    </div>
-                                    <div className="flex-1 min-w-0">
-                                        <div className="flex items-center gap-1.5 flex-wrap">
-                                            <span className="text-[11px] font-bold text-slate-700">{s.shopName}</span>
-                                            <span className="text-slate-300">·</span>
-                                            <span className="text-[11px] text-slate-600 truncate max-w-[160px]">{s.pageName}</span>
-                                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
-                                                s.isActive ? "bg-green-100 text-green-700" : "bg-slate-200 text-slate-500"
-                                            }`}>
-                                                {s.isActive ? "● Đang chạy" : "⏸ Tạm dừng"}
-                                            </span>
-                                            {s.recipientCount != null && (
-                                                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-600">
-                                                    👥 {s.recipientCount} data
-                                                </span>
-                                            )}
-                                        </div>
-                                        <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                                            <span className="text-[11px] text-violet-600 font-semibold">
-                                                📅 {segHours} {tz ? `(${tz.flag} ${tz.label})` : ""}
-                                            </span>
-                                            {s.nextFireAt && nextMs !== null && nextMs > 0 && (
-                                                <span className="text-[10px] text-slate-400">⏳ còn {formatCountdown(nextMs)}</span>
-                                            )}
-                                        </div>
-                                        {/* Hiển thị preview nội dung từng đoạn */}
-                                        {segs.length > 0 && (
-                                            <div className="mt-1 space-y-0.5">
-                                                {segs.map(seg => (
-                                                    <p key={seg.segIdx} className="text-[10px] text-slate-400 truncate">
-                                                        <span className="text-slate-500 font-medium">Đ{seg.segIdx + 1} ({seg.hour}h):</span>{' '}
-                                                        {seg.message ? seg.message.slice(0, 60) + (seg.message.length > 60 ? '…' : '') : '(trống)'}
-                                                    </p>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
+                {screen !== "tong-quan" && !page && (
+                    <div className="panel">
+                        <Empty
+                            title="Chưa chọn page"
+                            hint="Chọn một page ở góc trên bên phải, hoặc quay lại Tổng quan để xem danh sách."
+                            action={
+                                <button className="btn btn-primary" onClick={() => setScreen("tong-quan")}>
+                                    Về Tổng quan
+                                </button>
+                            }
+                        />
+                    </div>
+                )}
 
-                                {/* ─── Segment Status: hiển thị 4 ô giờ ─── */}
-                                {s.isActive && (() => {
-                                    const allSlots = [
-                                        { idx: 0, hour: 6, icon: "🌅", time: "6h" },
-                                        { idx: 1, hour: 11, icon: "☀️", time: "11h" },
-                                        { idx: 2, hour: 17, icon: "🌆", time: "17h" },
-                                        { idx: 3, hour: 21, icon: "🌙", time: "21h" },
-                                    ];
-                                    // Map segment status by hour
-                                    const segStatusMap = new Map<number, ScheduleSegment>();
-                                    for (const seg of segs) segStatusMap.set(seg.hour, seg);
-                                    const sentCount = segs.filter(seg => seg.status === 'sent').length;
-                                    const errorCount = segs.filter(seg => seg.status === 'error').length;
-                                    
-                                    return (
-                                        <div className="space-y-1.5 pt-1">
-                                            <div className="flex items-center gap-1">
-                                                {allSlots.map((slot) => {
-                                                    const seg = segStatusMap.get(slot.hour);
-                                                    const isScheduled = !!seg;
-                                                    const status = seg?.status || 'pending';
-                                                    
-                                                    return (
-                                                        <div
-                                                            key={slot.idx}
-                                                            title={seg?.error || ''}
-                                                            className={`flex-1 flex flex-col items-center justify-center gap-0 py-1 rounded-lg text-[10px] font-semibold transition-all ${
-                                                                !isScheduled
-                                                                    ? "bg-slate-50 text-slate-300 border border-slate-100"
-                                                                    : status === 'sent'
-                                                                    ? "bg-green-100 text-green-700 border border-green-200"
-                                                                    : status === 'error'
-                                                                    ? "bg-red-100 text-red-700 border border-red-200"
-                                                                    : status === 'sending'
-                                                                    ? "bg-amber-100 text-amber-700 border border-amber-300 animate-pulse"
-                                                                    : "bg-yellow-50 text-yellow-700 border border-yellow-200"
-                                                            }`}
-                                                        >
-                                                            <div className="flex items-center gap-0.5">
-                                                                <span>{slot.icon}</span>
-                                                                <span>{slot.time}</span>
-                                                                {!isScheduled && <span>—</span>}
-                                                                {isScheduled && status === 'sent' && <span>✓</span>}
-                                                                {isScheduled && status === 'error' && <span>✗</span>}
-                                                                {isScheduled && status === 'sending' && <span>⚡</span>}
-                                                                {isScheduled && status === 'pending' && <span>⏳</span>}
-                                                            </div>
-                                                            {isScheduled && seg?.totalRecipients != null && (
-                                                                <span className="text-[8px] opacity-70">
-                                                                    {seg.successCount ?? 0}/{seg.totalRecipients}
-                                                                </span>
-                                                            )}
-                                                        </div>
-                                                    );
-                                                })}
-                                            </div>
-                                            <div className="flex items-center gap-1.5">
-                                                <span className="text-[10px] text-slate-400">
-                                                    Tổng: <span className="font-semibold text-green-600">✅ {segs.reduce((a, seg) => a + (seg.successCount || 0), 0)}</span>
-                                                    <span className="text-slate-300 mx-0.5">/</span>
-                                                    <span className="font-semibold text-slate-500">{segs.reduce((a, seg) => a + (seg.totalRecipients || 0), 0)} data</span>
-                                                    {segs.some(seg => (seg.errorCount || 0) > 0) && (
-                                                        <span className="text-red-400 ml-1">❌ {segs.reduce((a, seg) => a + (seg.errorCount || 0), 0)} lỗi</span>
-                                                    )}
-                                                </span>
-                                            </div>
-                                            <div className="flex items-center gap-1.5">
-                                                <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                                                    <div
-                                                        className={`h-full rounded-full transition-all duration-500 ${
-                                                            errorCount > 0 && sentCount === 0
-                                                                ? 'bg-gradient-to-r from-red-400 to-red-500'
-                                                                : 'bg-gradient-to-r from-green-400 to-emerald-500'
-                                                        }`}
-                                                        style={{ width: `${Math.min(100, (sentCount / segs.length) * 100)}%` }}
-                                                    />
-                                                </div>
-                                                <span className="text-[9px] text-slate-400 font-medium whitespace-nowrap">
-                                                    {sentCount}/{segs.length} đoạn
-                                                    {errorCount > 0 && <span className="text-red-400"> · {errorCount} lỗi</span>}
-                                                </span>
-                                            </div>
-                                        </div>
-                                    );
-                                })()}
-                                {isEditing && (
-                                    <div className="flex gap-2">
-                                        <input value={editNote} onChange={e => setEditNote(e.target.value)} placeholder="Ghi chú..." className="flex-1 text-xs rounded-lg border border-blue-200 px-2 py-1 focus:outline-none focus:ring-1 focus:ring-blue-300" />
-                                        <button onClick={() => saveNote(s.id)} className="text-xs px-2 py-1 rounded-lg bg-blue-500 text-white hover:bg-blue-600">Lưu</button>
-                                        <button onClick={() => setEditingScheduleId(null)} className="text-xs px-2 py-1 rounded-lg bg-slate-200 text-slate-600 hover:bg-slate-300">Huỷ</button>
-                                    </div>
-                                )}
-                                {!isEditing && s.note && <p className="text-[10px] text-slate-400 italic">📝 {s.note}</p>}
+                {screen === "kich-ban" && page && (
+                    <ScriptScreen
+                        page={page}
+                        schedule={schedule}
+                        msgs={msgs}
+                        medias={medias}
+                        labels={labels}
+                        uploadingSlot={uploadingSlot}
+                        saving={saving}
+                        onLabel={(i, v) => setLabels((p) => p.map((x, k) => (k === i ? v : x)))}
+                        onBody={(i, v) => setMsgs((p) => p.map((x, k) => (k === i ? v : x)))}
+                        onPaste={(i) => (e) => {
+                            const f = Array.from(e.clipboardData?.files ?? []);
+                            if (f.length) {
+                                e.preventDefault();
+                                void addSlotMedia(i, f);
+                            }
+                        }}
+                        onDrop={(i) => (e) => {
+                            const f = Array.from(e.dataTransfer?.files ?? []);
+                            if (f.length) {
+                                e.preventDefault();
+                                void addSlotMedia(i, f);
+                            }
+                        }}
+                        onPickFile={(i) => (e) => {
+                            const f = Array.from(e.target.files ?? []);
+                            if (f.length) void addSlotMedia(i, f);
+                            e.target.value = "";
+                        }}
+                        onRemoveMedia={(i, m) =>
+                            setMedias((p) => p.map((x, k) => (k === i ? x.filter((_, j) => j !== m) : x)))
+                        }
+                        onSave={saveScript}
+                        onToggleActive={toggleActive}
+                    />
+                )}
 
-                                {/* ─── Ngày bắt đầu + Lịch sử bắn thành công ─── */}
-                                <div className="pt-1.5 border-t border-slate-100 space-y-1">
-                                    <div className="flex items-center gap-1.5">
-                                        <CalendarClock className="h-3 w-3 text-slate-400 shrink-0" />
-                                        <span className="text-[10px] text-slate-400">
-                                            Bắt đầu: <span className="font-semibold text-slate-500">{new Date(s.createdAt).toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit', year: 'numeric' })}</span>
-                                        </span>
-                                    </div>
-                                    {s.firedDates && s.firedDates.length > 0 && (
-                                        <div className="flex items-start gap-1.5">
-                                            <CheckCircle2 className="h-3 w-3 text-green-500 shrink-0 mt-0.5" />
-                                            <div className="flex flex-wrap gap-1">
-                                                {s.firedDates.slice(-10).map(date => (
-                                                    <span key={date} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md bg-green-50 border border-green-200 text-[9px] font-semibold text-green-700">
-                                                        ✓ {new Date(date + 'T00:00:00').toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit' })}
-                                                    </span>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    )}
-                                    {(!s.firedDates || s.firedDates.length === 0) && (
-                                        <div className="flex items-center gap-1.5">
-                                            <CheckCircle2 className="h-3 w-3 text-slate-300 shrink-0" />
-                                            <span className="text-[10px] text-slate-300 italic">Chưa bắn thành công ngày nào</span>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        );
-                    })}
+                {screen === "ban-tay" && page && (
+                    <ManualScreen
+                        page={page}
+                        customers={customers}
+                        loading={loadingCust}
+                        selected={selected}
+                        onToggle={(id) =>
+                            setSelected((prev) => {
+                                const n = new Set(prev);
+                                if (n.has(id)) n.delete(id);
+                                else n.add(id);
+                                return n;
+                            })
+                        }
+                        onToggleAll={() =>
+                            setSelected((prev) =>
+                                prev.size === customers.length ? new Set() : new Set(customers.map((c) => c.id))
+                            )
+                        }
+                        body={manualBody}
+                        media={manualMedia}
+                        uploading={manualUploading}
+                        sending={sending}
+                        progress={progress}
+                        onBody={setManualBody}
+                        onPaste={(e) => {
+                            const f = Array.from(e.clipboardData?.files ?? []);
+                            if (f.length) {
+                                e.preventDefault();
+                                void addManualMedia(f);
+                            }
+                        }}
+                        onDrop={(e) => {
+                            const f = Array.from(e.dataTransfer?.files ?? []);
+                            if (f.length) {
+                                e.preventDefault();
+                                void addManualMedia(f);
+                            }
+                        }}
+                        onPickFile={(e) => {
+                            const f = Array.from(e.target.files ?? []);
+                            if (f.length) void addManualMedia(f);
+                            e.target.value = "";
+                        }}
+                        onRemoveMedia={(i) => setManualMedia((p) => p.filter((_, k) => k !== i))}
+                        onSend={sendManual}
+                        onReload={() => void loadCustomers(pageId)}
+                    />
+                )}
+            </main>
+
+            {toast && (
+                <div
+                    className="panel fixed bottom-5 left-1/2 z-50 max-w-[92vw] -translate-x-1/2 px-4 py-2.5 text-[13.5px] font-medium"
+                    style={{
+                        background: toast.kind === "bad" ? "var(--bad-soft)" : "var(--ok-soft)",
+                        color: toast.kind === "bad" ? "var(--bad)" : "var(--ok)",
+                        borderColor: "transparent",
+                    }}
+                >
+                    {toast.text}
                 </div>
             )}
         </div>
