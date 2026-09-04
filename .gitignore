@@ -26,3 +26,8 @@ config/pos-shops.json
 
 # Báo cáo phân tích (chứa nội dung chat của khách) — KHÔNG commit
 bao-cao/
+
+# App web (Next.js) — build và phụ thuộc
+web/node_modules/
+web/.next/
+web/.env.local
