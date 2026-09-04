@@ -5,7 +5,8 @@ ghi địa chỉ thật ở đây). Ubuntu 24.04, cài tại `/opt/banbot`.
 
 | Thành phần | Giá trị |
 |---|---|
-| Dashboard | `https://<IP máy chủ>:8446` (nginx → 127.0.0.1:3110) |
+| Giao diện chính | `https://<IP máy chủ>:8447` (nginx → 127.0.0.1:3112) — chọn page, bảng khách, soạn tin, bắn ngay |
+| Dashboard chỉ đọc | `https://<IP máy chủ>:8446` (nginx → 127.0.0.1:3110) — báo cáo, truy vết khách |
 | Webhook | 127.0.0.1:3111 (chưa mở ra ngoài) |
 | Database | PostgreSQL 16, database `banbot`, user `banbot` |
 | Bí mật | `/opt/banbot/.env` (chmod 600) — KHÔNG có trong git |
@@ -15,10 +16,11 @@ ghi địa chỉ thật ở đây). Ubuntu 24.04, cài tại `/opt/banbot`.
 
 | Tên | Lịch | Việc |
 |---|---|---|
-| `banbot-web` | liên tục | dashboard |
+| `banbot-ui` | liên tục | giao diện chính (Next.js) |
+| `banbot-web` | liên tục | dashboard chỉ đọc |
 | `banbot-webhook` | liên tục | nhận đơn / tin khách |
 | `banbot-sync` | phút 5 mỗi giờ | đồng bộ page nào đang 3h sáng giờ địa phương |
-| `banbot-send` | mỗi 5 phút | gửi lượt tới hạn |
+| `banbot-send` | mỗi phút | gửi lượt tới hạn (cả theo lịch lẫn bắn tay) |
 | `banbot-pos` | 8,23,38,53 | đối chiếu đơn POS |
 | `banbot-health` | 2,17,32,47 | giám sát sức khoẻ page |
 
@@ -54,8 +56,30 @@ Page mới bật chạy ở chế độ khởi động dần: 25% tệp trong 3 
 ## Gỡ cài đặt
 
 ```bash
-pm2 delete banbot-web banbot-webhook banbot-send banbot-sync banbot-pos banbot-health
+pm2 delete banbot-ui banbot-web banbot-webhook banbot-send banbot-sync banbot-pos banbot-health
 pm2 save
-rm /etc/nginx/sites-enabled/banbot && systemctl reload nginx
+rm /etc/nginx/sites-enabled/banbot /etc/nginx/sites-enabled/banbot-ui && systemctl reload nginx
 # dữ liệu vẫn còn trong database banbot — xoá riêng nếu muốn
 ```
+
+## Ảnh
+
+Ảnh dán vào ô soạn được lưu **trong database** (bảng `media`), không để trên đĩa.
+Bản v1 ghi vào `public/uploads` rồi gửi link đi, nhưng Next.js không phục vụ file
+ghi thêm sau khi build nên khách nhận link chết.
+
+`PUBLIC_URL` trong `web/.env.local` đặt là `http://127.0.0.1:3112` — **cố ý dùng
+địa chỉ nội bộ**. Engine tự tải ảnh về rồi upload nhị phân lên Pancake, nên link
+chỉ cần server tự truy cập được; Facebook không bao giờ phải tải từ link này.
+Nhờ vậy chứng chỉ tự ký không gây trở ngại.
+
+## Xây lại giao diện sau khi sửa code
+
+```bash
+cd /opt/banbot/web
+nohup npm run build > ../logs/ui-build.log 2>&1 &   # nohup: build sống khi ngắt SSH
+# chờ .next/BUILD_ID xuất hiện rồi:
+pm2 restart banbot-ui
+```
+
+Build mất vài phút. **Phải có `nohup`** — không thì build chết theo phiên SSH.

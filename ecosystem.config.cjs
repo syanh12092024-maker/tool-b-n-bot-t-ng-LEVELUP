@@ -23,6 +23,17 @@ module.exports = {
             env: { NODE_ENV: "production" },
         },
         {
+            // Giao diện chính (Next.js, kế thừa từ v1): chạy liên tục
+            name: "banbot-ui",
+            script: "node_modules/next/dist/bin/next",
+            args: "start -p 3112",
+            cwd: `${cwd}/web`,
+            autorestart: true,
+            max_restarts: 50,
+            restart_delay: 3000,
+            env: { NODE_ENV: "production" },
+        },
+        {
             // Dashboard chỉ đọc: chạy liên tục
             name: "banbot-web",
             script: "dist/web/server.js",

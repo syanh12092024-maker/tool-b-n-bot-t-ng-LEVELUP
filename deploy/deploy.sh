@@ -18,18 +18,25 @@ npm run test:smoke
 echo "▶ Biên dịch…"
 npm run build
 
-echo "▶ Đẩy lên $HOST:$DIR…"
+echo "▶ Đẩy engine lên $HOST:$DIR…"
 rsync -az --delete ./dist "$HOST:$DIR/"
 rsync -az ./migrations ./kich-ban ./deploy ./package.json ./package-lock.json ./ecosystem.config.cjs ./README.md "$HOST:$DIR/"
 
-echo "▶ Cài gói + migrate + khởi động lại…"
+echo "▶ Đẩy giao diện…"
+# KHÔNG đụng .env.local trên server — chứa mật khẩu và chuỗi kết nối
+rsync -az --delete --exclude node_modules --exclude .next --exclude .env.local ./web "$HOST:$DIR/"
+
+echo "▶ Cài gói + migrate + build giao diện + khởi động lại…"
 ssh "$HOST" "cd $DIR \
   && npm ci --omit=dev --silent \
   && node dist/db/migrate.js \
-  && pm2 restart banbot-web banbot-webhook --update-env \
+  && cd web && npm ci --omit=dev --silent && npm run build \
+  && cd $DIR \
+  && pm2 restart banbot-web banbot-webhook banbot-ui --update-env \
   && pm2 save >/dev/null"
 
-echo "▶ Kiểm tra dashboard còn sống…"
-ssh "$HOST" "curl -sf -o /dev/null -w 'healthz → HTTP %{http_code}\n' http://127.0.0.1:3110/healthz"
+echo "▶ Kiểm tra còn sống…"
+ssh "$HOST" "curl -sf -o /dev/null -w 'dashboard → HTTP %{http_code}\n' http://127.0.0.1:3110/healthz
+             curl -sf -o /dev/null -w 'giao diện → HTTP %{http_code}\n' http://127.0.0.1:3112/"
 
 echo "✅ Xong → https://$(ssh -G \"$HOST\" | awk '/^hostname /{print $2}'):8446"
