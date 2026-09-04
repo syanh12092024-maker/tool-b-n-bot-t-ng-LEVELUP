@@ -87,11 +87,11 @@ try {
     // ═══ 1. MIGRATION ═══════════════════════════════════════════════════════
     section("Migration");
     const applied = await migrate();
-    eq("Áp dụng đúng 2 file migration", applied, 2);
+    eq("Áp dụng đúng 3 file migration", applied, 3);
     const tables = await query<{ n: number }>(
         `SELECT COUNT(*)::int AS n FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
     );
-    eq("Tạo đủ 11 bảng (10 nghiệp vụ + schema_migrations)", tables[0]?.n, 11);
+    eq("Tạo đủ 12 bảng (11 nghiệp vụ + schema_migrations)", tables[0]?.n, 12);
     eq("Chạy migrate lần 2 không áp dụng lại", await migrate(), 0);
 
     // ═══ 2. PAGE ════════════════════════════════════════════════════════════
@@ -772,9 +772,134 @@ try {
     eq("Báo cáo: 1 hội thoại có khách nhắn", caRep.withCustomerMessage, 1);
     eq("Báo cáo: tỉ lệ để lại SĐT 100%", caRep.phoneRate, 1);
     check("Báo cáo bắt được vấn đề 'nghi lừa đảo'", caRep.objections.some((o) => o.key === "scam" && o.count === 1));
+    // ⭐ Một tin khớp nhiều nhóm thì vẫn đếm cho cả hai, nhưng không trích trùng câu
+    const multiRep = ca.buildReport([
+        // Hội thoại 1: một tin khớp CẢ scam lẫn payment
+        ca.analyzeConversation([
+            { fromPage: false, senderName: "X", text: "this is a scam, what about payment?", at: null, adText: null },
+        ]),
+        // Hội thoại 2: chỉ khớp payment — đây là câu riêng để nhóm payment dùng
+        ca.analyzeConversation([
+            { fromPage: false, senderName: "Y", text: "can I pay by installment?", at: null, adText: null },
+        ]),
+    ]);
+    const scamO = multiRep.objections.find((o) => o.key === "scam");
+    const payO = multiRep.objections.find((o) => o.key === "payment");
+    check("Tin khớp 2 nhóm vẫn được đếm cho cả hai", scamO?.count === 1 && payO?.count === 2);
+    eq("⭐ …nhưng nhóm sau trích câu RIÊNG, không lặp lại câu nhóm trước",
+        scamO?.samples[0] === payO?.samples[0], false);
+    check("…câu riêng đó là câu đúng của nhóm payment",
+        (payO?.samples[0] ?? "").includes("installment"));
+
+    // Nhóm mà MỌI dẫn chứng đã hiện ở nhóm trên → để trống, không lặp lại
+    const onlyShared = ca.buildReport([
+        ca.analyzeConversation([
+            { fromPage: false, senderName: "Z", text: "this is a scam, what about payment?", at: null, adText: null },
+        ]),
+    ]);
+    const sh = onlyShared.objections.find((o) => o.key === "payment");
+    check("Nhóm không còn dẫn chứng riêng vẫn được ĐẾM", sh?.count === 1);
+    eq("⭐ …nhưng KHÔNG lặp lại câu đã hiện ở nhóm trên", sh?.samples.length, 0);
+    const shSlots = ca.suggestSlots(onlyShared, 12);
+    check("Khung soạn nói rõ vì sao ô đó không có trích dẫn",
+        shSlots.some((x) => x.hint.includes("Dẫn chứng đã hiện ở ô trên")));
+
     check("Báo cáo có trích dẫn thật kèm theo",
         (caRep.objections.find((o) => o.key === "scam")?.samples[0] ?? "").includes("scam"));
     eq("Báo cáo: giá hay báo nhất", caRep.prices[0], { currency: "SAR", amount: 100, count: 1 });
+
+    // ═══ 19. KHUNG SOẠN NỘI DUNG TRÊN DASHBOARD ═════════════════════════════
+    section("Khung soạn nội dung");
+    eq("Migration 003 đã chạy",
+        (await queryOne<{ n: number }>(`SELECT COUNT(*)::int AS n FROM schema_migrations WHERE name = '003_phan_tich.sql'`))?.n, 1);
+
+    const sPage = await pagesRepo.upsert({ pageId: "SMOKE_SOAN", pageName: "Page soạn", market: "Test", utcOffset });
+    await pagesRepo.setActive(sPage.id, true, 100);
+
+    // Dựng báo cáo từ hội thoại giả lập có đủ tín hiệu
+    const fakeConvs = [
+        ca.analyzeConversation([
+            { fromPage: false, senderName: "A", text: "How much are the dentures?", at: null, adText: "QC NESLEMY" },
+            { fromPage: true, senderName: "P", text: "100 SAR for upper and lower", at: null, adText: null },
+            { fromPage: false, senderName: "A", text: "is this a scam?", at: null, adText: null },
+            { fromPage: true, senderName: "P", text: "Send name, phone and address please", at: null, adText: null },
+            { fromPage: false, senderName: "A", text: "Ali 0501234567 Riyadh", at: null, adText: null },
+        ]),
+        ca.analyzeConversation([
+            { fromPage: false, senderName: "B", text: "how much", at: null, adText: null },
+            { fromPage: true, senderName: "P", text: "100 SAR for upper and lower", at: null, adText: null },
+            { fromPage: false, senderName: "B", text: "will it fit me without measurement?", at: null, adText: null },
+        ]),
+    ];
+    const sReport = ca.buildReport(fakeConvs);
+
+    const slots = ca.suggestSlots(sReport, 12);
+    eq("Sinh đúng 12 ô", slots.length, 12);
+    check("Ô báo giá nêu đúng giá tìm được", (slots[1]?.hint ?? "").includes("SAR 100"));
+    check("Ô 1 nhắc tỉ lệ hỏi giá ngay câu đầu", /\d+% hỏi giá ngay/.test(slots[0]?.hint ?? ""));
+    check("⭐ Có ô dựng từ vấn đề CÓ THẬT trong hội thoại",
+        slots.some((x) => x.label.includes("gỡ:") && /lừa đảo|vừa/.test(x.label)));
+    check("…kèm trích dẫn thật của khách", slots.some((x) => x.hint.includes("Khách nói:")));
+    check("Ô lấy SĐT gợi ý dùng lại câu đã chốt được khách",
+        (slots.find((x) => x.label.includes("hỏi thẳng"))?.seed ?? "").includes("phone"));
+
+    await scriptsRepo.saveAnalysis(sPage.id, sReport, fakeConvs.length);
+    const backAn = await scriptsRepo.getAnalysis(sPage.id);
+    check("Lưu và đọc lại báo cáo khỏi database", backAn !== null && backAn.conversations === 2);
+    await scriptsRepo.saveAnalysis(sPage.id, sReport, 5);
+    eq("Phân tích lại thì ghi đè, không nhân đôi",
+        (await queryOne<{ n: number }>(`SELECT COUNT(*)::int AS n FROM page_analysis WHERE page_id = $1`, [sPage.id]))?.n, 1);
+
+    // HTTP
+    const web3 = mkSrv();
+    const port3 = 19700 + Math.floor(Math.random() * 90);
+    await new Promise<void>((r) => web3.listen(port3, () => r()));
+    const b3 = `http://127.0.0.1:${port3}`;
+
+    const soanTrong = await (await fetch(`${b3}/page/${sPage.id}/soan`)).text();
+    check("Chưa có kịch bản → hiện bảng khung để xem trước", soanTrong.includes("Tạo khung 12 tin"));
+    check("…và nêu đúng giá trong phần xem trước", soanTrong.includes("SAR 100"));
+
+    const taoRes = await fetch(`${b3}/page/${sPage.id}/soan/tao`, {
+        method: "POST", redirect: "manual", headers: { Origin: b3 },
+    });
+    eq("Bấm tạo khung → 303", taoRes.status, 303);
+    check("…chuyển về màn hình soạn kèm báo đã tạo", (taoRes.headers.get("location") ?? "").includes("created=1"));
+
+    const created = await scriptsRepo.activeScriptForPage(sPage.id);
+    check("Kịch bản đã được tạo", created !== null);
+    const cMsgs = await scriptsRepo.messagesForScript(created!.id);
+    eq("Đủ 12 tin", cMsgs.length, 12);
+    check("Nhãn lấy từ khung gợi ý", (cMsgs[1]?.label ?? "").includes("báo giá"));
+
+    const soanCo = await (await fetch(`${b3}/page/${sPage.id}/soan`)).text();
+    check("Màn hình soạn có đủ 12 ô nhập", (soanCo.match(/name="body_\d+"/g) ?? []).length === 12);
+    check("⭐ Ô chưa nhập được đánh dấu để không bỏ sót", soanCo.includes("chưa nhập"));
+    check("…và đếm số ô còn thiếu", /còn 12\/12 ô chưa nhập/.test(soanCo));
+    check("Hiện số liệu hội thoại ngay trên đầu", soanCo.includes("Hội thoại đã đọc"));
+    check("Hiện danh sách vấn đề của khách", soanCo.includes("Vấn đề khiến khách không chốt"));
+
+    // Nhập nội dung rồi lưu, quay về đúng màn hình soạn
+    const fill = new URLSearchParams();
+    for (let i = 0; i < 12; i++) {
+        fill.set(`body_${i}`, `Nội dung thật cho tin ${i + 1}`);
+        fill.set(`media_${i}`, "");
+        fill.set(`label_${i}`, cMsgs[i]?.label ?? `tin ${i + 1}`);
+    }
+    const luu = await fetch(`${b3}/page/${sPage.id}/script`, {
+        method: "POST", body: fill, redirect: "manual",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: b3, Referer: `${b3}/page/${sPage.id}/soan` },
+    });
+    eq("Lưu từ màn hình soạn → 303", luu.status, 303);
+    check("⭐ Quay về đúng màn hình soạn, không nhảy sang màn hình sửa",
+        (luu.headers.get("location") ?? "").includes("/soan?saved=1"));
+    const after = await scriptsRepo.messagesForScript(created!.id);
+    eq("Nội dung đã lưu thật", after[0]?.body, "Nội dung thật cho tin 1");
+    const soanXong = await (await fetch(`${b3}/page/${sPage.id}/soan`)).text();
+    check("…và màn hình báo đã nhập đủ", soanXong.includes("đã nhập đủ 12 ô"));
+
+    await new Promise<void>((r) => web3.close(() => r()));
+    await query(`DELETE FROM pages WHERE page_id = 'SMOKE_SOAN'`);
 
     await closePool();
 } catch (err) {

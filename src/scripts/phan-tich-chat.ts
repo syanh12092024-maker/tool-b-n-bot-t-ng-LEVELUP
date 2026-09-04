@@ -2,6 +2,8 @@ import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { runJob, isMain } from "../lib/runner.js";
 import { mapConcurrent } from "../lib/http.js";
 import * as pancake from "../clients/pancake.js";
+import * as pagesRepo from "../db/repositories/pages.repo.js";
+import * as scriptsRepo from "../db/repositories/scripts.repo.js";
 import { analyzeConversation, buildReport, type ChatReport, type ConversationFacts } from "../domain/chat-analysis.js";
 
 /**
@@ -118,6 +120,7 @@ export function renderReport(r: ChatReport, pageName: string): string {
         line();
         line(`  ── Trích dẫn thật ──`);
         for (const o of r.objections.slice(0, 6)) {
+            if (o.samples.length === 0) continue; // dẫn chứng đã hiện ở nhóm trên
             line();
             line(`  【${o.label}】`);
             for (const sm of o.samples) line(`     "${sm}"`);
@@ -171,6 +174,17 @@ if (isMain(import.meta.url)) {
 
         const text = renderReport(report, pageName);
         console.log(text);
+
+        // Lưu vào database để dashboard hiện được số liệu ngay cạnh ô nhập.
+        // Page chưa thêm vào hệ thống thì bỏ qua — báo cáo vẫn in ra bình thường.
+        const dbPage = await pagesRepo.findByFbPageId(pageId);
+        if (dbPage) {
+            await scriptsRepo.saveAnalysis(dbPage.id, report, usable.length);
+            console.log(`  ✅ Đã lưu vào hệ thống — mở dashboard, trang của page này để soạn nội dung.\n`);
+        } else {
+            console.log(`  ⚠️  Page chưa có trong hệ thống nên chưa hiện được lên dashboard.`);
+            console.log(`     Thêm bằng: npm run page:add -- --page ${pageId} --market <thị trường>\n`);
+        }
 
         if (!existsSync("bao-cao")) mkdirSync("bao-cao", { recursive: true });
         const stamp = new Date().toISOString().slice(0, 10);

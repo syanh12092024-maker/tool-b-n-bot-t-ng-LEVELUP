@@ -268,16 +268,26 @@ export function findObjections(convs: ConversationFacts[]): ObjectionHit[] {
     const withMsg = convs.filter((c) => c.customerMessages.length > 0);
     const out: ObjectionHit[] = [];
 
+    // Một tin dài có thể khớp nhiều nhóm (ví dụ tin tố lừa đảo cũng nhắc tới
+    // thanh toán). Vẫn đếm cho cả hai — đó là sự thật — nhưng KHÔNG trích cùng
+    // một câu ở hai chỗ, vì nhìn ra như lỗi và không thêm thông tin gì.
+    const usedSamples = new Set<string>();
+
     for (const g of OBJECTION_GROUPS) {
-        const samples: string[] = [];
+        const hits: string[] = [];
         let count = 0;
         for (const c of withMsg) {
             const hit = c.customerMessages.find((m) => g.re.test(m));
             if (hit) {
                 count++;
-                if (samples.length < 3) samples.push(hit.replace(/\s+/g, " ").trim().slice(0, 160));
+                hits.push(hit.replace(/\s+/g, " ").trim().slice(0, 160));
             }
         }
+        // Chỉ trích câu CHƯA nhóm nào dùng. Nếu toàn bộ dẫn chứng của nhóm này đã
+        // hiện ở nhóm trên thì để trống — lặp lại y nguyên một câu ở hai chỗ nhìn
+        // như lỗi và không thêm thông tin gì. Số đếm vẫn giữ nguyên vì đó là sự thật.
+        const samples = hits.filter((h) => !usedSamples.has(h)).slice(0, 3);
+        for (const sm of samples) usedSamples.add(sm);
         if (count > 0) {
             out.push({ key: g.key, label: g.label, count, pct: count / Math.max(1, withMsg.length), samples });
         }
@@ -354,4 +364,104 @@ export function buildReport(convs: ConversationFacts[]): ChatReport {
             .sort((a, b) => b.length - a.length)
             .slice(0, 5),
     };
+}
+
+// ─── Khung soạn nội dung ──────────────────────────────────────────────────────
+
+export interface SlotSuggestion {
+    /** Nhãn ngắn, lưu vào script_messages.label */
+    label: string;
+    /** Gợi ý chi tiết hiện dưới ô nhập — nói rõ VÌ SAO có ô này */
+    hint: string;
+    /** Câu nhân viên đã dùng, để bấm chèn thẳng vào ô */
+    seed?: string;
+}
+
+const CUM = ["A · giới thiệu", "B · bằng chứng", "C · thúc chốt"];
+
+/**
+ * Dựng khung 12 ô nhập RIÊNG cho một page, từ chính số liệu hội thoại của page đó.
+ *
+ * Không viết hộ nội dung — chỉ nói rõ mỗi ô nên trả lời điều gì, kèm bằng chứng
+ * lấy từ dữ liệu thật (giá bao nhiêu, khách hay hỏi gì, vướng ở đâu). Người viết
+ * nhìn con số rồi tự đặt câu.
+ */
+export function suggestSlots(r: ChatReport, count = 12): SlotSuggestion[] {
+    const price = r.prices[0];
+    const priceStr = price ? `${price.currency} ${price.amount}` : "chưa tìm thấy giá trong hội thoại";
+    const opening = r.openingQuestions.slice(0, 3).map((q) => q.phrase).join(" · ") || "chưa đủ dữ liệu";
+    const askPct = r.withCustomerMessage
+        ? Math.round((r.priceAskedFirstTurn / r.withCustomerMessage) * 100)
+        : 0;
+    const topStaff = r.staffReplies[0]?.sample;
+    const closer = r.linesBeforePhone[0]?.sample;
+    const objs = r.objections;
+
+    const slots: SlotSuggestion[] = [
+        {
+            label: "A1 · chào + trả lời ngay câu hay hỏi nhất",
+            hint: `Khách mở lời bằng: “${opening}”. ${askPct}% hỏi giá ngay câu đầu — đừng vòng vo.`,
+        },
+        {
+            label: "A2 · báo giá",
+            hint: `Nhân viên đang báo ${priceStr} (${price?.count ?? 0} lần). Ghi kèm phí ship và hình thức thanh toán.`,
+            ...(topStaff ? { seed: topStaff } : {}),
+        },
+        {
+            label: "A3 · công dụng chính",
+            hint: r.adTexts[0]
+                ? `Nối tiếp lời hứa của quảng cáo đã kéo khách vào, đừng nói khác đi.`
+                : `Nêu 2–3 lợi ích cụ thể, tránh nói chung chung.`,
+            ...(r.adTexts[0] ? { seed: r.adTexts[0].sample } : {}),
+        },
+        {
+            label: "A4 · cách dùng / cách đặt",
+            hint: `Khách trung bình trao đổi ${r.avgExchanges} lượt mới xong — rút ngắn bằng cách nói trước quy trình.`,
+        },
+        {
+            label: "B1 · bằng chứng khách thật",
+            hint: `Ảnh hoặc lời khách đã mua. Chỉ ${(r.phoneRate * 100).toFixed(0)}% khách để lại SĐT — thiếu tin tưởng là rào cản lớn.`,
+        },
+    ];
+
+    // Bốn ô tiếp lấy thẳng từ vấn đề có thật, xếp theo mức phổ biến
+    for (let i = 0; i < 4; i++) {
+        const o = objs[i];
+        slots.push(
+            o
+                ? {
+                      label: `B${i + 2} · gỡ: ${o.label.toLowerCase()}`,
+                      hint: o.samples[0]
+                          ? `${o.count} hội thoại vướng chỗ này (${Math.round(o.pct * 100)}%). Khách nói: “${o.samples[0]}”`
+                          : `${o.count} hội thoại vướng chỗ này (${Math.round(o.pct * 100)}%). Dẫn chứng đã hiện ở ô trên — cùng một tin nhắc tới nhiều vấn đề.`,
+                  }
+                : {
+                      label: `B${i + 2} · cam kết / gỡ băn khoăn`,
+                      hint: `Chưa phát hiện băn khoăn thứ ${i + 1} trong 100 hội thoại — tự chọn nội dung.`,
+                  }
+        );
+    }
+
+    slots.push(
+        {
+            label: "C1 · ưu đãi có hạn",
+            hint: `Lấy đúng ưu đãi nhân viên đang dùng, đừng bịa ưu đãi mới.`,
+        },
+        {
+            label: "C2 · hỏi thẳng để lấy thông tin",
+            hint: closer
+                ? `Câu này đã khiến khách đưa số điện thoại — dùng lại gần nguyên văn.`
+                : `Hỏi thẳng tên + SĐT + địa chỉ. Càng ít bước càng dễ chốt.`,
+            ...(closer ? { seed: closer } : {}),
+        },
+        {
+            label: "C3 · chốt cuối",
+            hint: `Tin cuối của chuỗi. Nhẹ nhàng, để ngỏ cửa quay lại.`,
+        }
+    );
+
+    return slots.slice(0, count).map((s, i) => ({
+        ...s,
+        label: s.label || `${CUM[Math.floor(i / 4)] ?? ""} · tin ${i + 1}`,
+    }));
 }

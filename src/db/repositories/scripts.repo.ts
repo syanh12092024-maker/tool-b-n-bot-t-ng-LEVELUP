@@ -1,5 +1,6 @@
 import { query, queryOne, withTransaction } from "../pool.js";
 import type { Script, ScriptMessage } from "../../domain/types.js";
+import { config } from "../../config/index.js";
 
 /** Kịch bản nuôi dưỡng và 12 nội dung của nó. */
 
@@ -106,4 +107,55 @@ export async function updateMessageBodies(
         }
         return changed;
     });
+}
+
+// ─── Kết quả phân tích hội thoại ──────────────────────────────────────────────
+
+export interface StoredAnalysis {
+    report: Record<string, unknown>;
+    conversations: number;
+    analyzed_at: Date;
+}
+
+export async function saveAnalysis(
+    pageDbId: number,
+    report: unknown,
+    conversations: number
+): Promise<void> {
+    await query(
+        `INSERT INTO page_analysis (page_id, report, conversations, analyzed_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (page_id) DO UPDATE
+            SET report = EXCLUDED.report,
+                conversations = EXCLUDED.conversations,
+                analyzed_at = now()`,
+        [pageDbId, JSON.stringify(report), conversations]
+    );
+}
+
+export function getAnalysis(pageDbId: number): Promise<StoredAnalysis | null> {
+    return queryOne<StoredAnalysis>(
+        `SELECT report, conversations, analyzed_at FROM page_analysis WHERE page_id = $1`,
+        [pageDbId]
+    );
+}
+
+/**
+ * Tạo kịch bản rỗng gồm n tin để người dùng tự nhập trên dashboard.
+ *
+ * Nhãn lấy từ khung soạn chuẩn (3 cụm: giới thiệu → bằng chứng → thúc chốt),
+ * nội dung để trống hẳn. Ràng buộc CHECK ở DB không cho tin rỗng, nên tạm điền
+ * một dấu gạch — người dùng sẽ thay ngay ở màn hình nhập.
+ */
+export async function createEmptyScript(
+    pageDbId: number,
+    name: string,
+    labels: string[]
+): Promise<{ scriptId: number; count: number }> {
+    const messages = labels.map((label) => ({ label, body: "—", media: [] as string[] }));
+    const { script } = await replaceActiveScript(pageDbId, name, messages, {
+        journeyDays: config.journey.days,
+        slotsPerDay: config.journey.slotsPerDay,
+    });
+    return { scriptId: script.id, count: messages.length };
 }

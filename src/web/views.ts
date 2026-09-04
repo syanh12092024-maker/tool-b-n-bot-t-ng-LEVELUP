@@ -1,5 +1,6 @@
 import { config } from "../config/index.js";
 import { messageIndexFor } from "../domain/journey.js";
+import { suggestSlots, type ChatReport } from "../domain/chat-analysis.js";
 import * as R from "../db/repositories/report.repo.js";
 import * as scriptsRepo from "../db/repositories/scripts.repo.js";
 import {
@@ -10,6 +11,11 @@ import {
 /** Các trang của dashboard. Mỗi hàm trả về HTML hoàn chỉnh. */
 
 const SLOT_NAMES = ["🌅 sáng", "☀️ trưa", "🌆 chiều", "🌙 tối"];
+
+const LANG_LABEL: Record<string, string> = {
+    ar: "Ả Rập", ja: "Nhật", zh: "Trung", ko: "Hàn", th: "Thái",
+    vi: "Việt", latin: "Anh", unknown: "không rõ",
+};
 
 function slotLabel(i: number | null): string {
     if (i === null || i < 0) return "—";
@@ -133,6 +139,7 @@ export async function pageDetail(id: number): Promise<string | null> {
     const scriptLink = scriptData
         ? `<a href="/page/${id}/script">${esc(scriptData.script.name)}</a> — ${scriptData.messages.length} nội dung`
         : `<span class="err">Chưa có kịch bản — page này không gửi được gì</span>`;
+    const soanBtn = `<a href="/page/${id}/soan" style="display:inline-block;background:var(--accent);color:var(--card);border-radius:7px;padding:7px 16px;font-size:13px;font-weight:700;text-decoration:none;margin-left:10px">✍️ Soạn nội dung</a>`;
 
     const body = `<p class="crumb"><a href="/">Tổng quan</a> › ${esc(page.page_name)}</p>
         <h1>${esc(page.page_name)} <span class="sub">${esc(page.market)} · ${esc(tz(page.utc_offset))} · <span class="mono">${esc(page.page_id)}</span></span></h1>
@@ -140,7 +147,7 @@ export async function pageDetail(id: number): Promise<string | null> {
             ${page.is_active ? healthBadge(page.health_state) : badge("tắt", "muted")}
             ${page.ramp_percent < 100 ? badge(`khởi động dần ${page.ramp_percent}%`, "warn") : ""}
             ${page.pancake_shop_id ? badge(`POS shop ${page.pancake_shop_id}`, "muted") : badge("chưa gắn shop POS", "muted")}
-            &nbsp; Kịch bản: ${scriptLink}
+            &nbsp; Kịch bản: ${scriptLink}${soanBtn}
         </p>
         ${qStats}
         ${card("Phân bố hành trình", distBody, "Mỗi khách ở ngày thứ mấy, và hôm nay họ nhận tin số mấy")}
@@ -438,6 +445,166 @@ export async function scriptSave(id: number, form: URLSearchParams): Promise<str
 
     try {
         await scriptsRepo.updateMessageBodies(data.script.id, edits);
+        return null;
+    } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+    }
+}
+
+// ═══ Khung soạn nội dung ══════════════════════════════════════════════════════
+
+/**
+ * Màn hình soạn 12 tin, có số liệu hội thoại thật của chính page đó nằm ngay cạnh.
+ *
+ * Vì sao không dùng lại màn hình Sửa: màn hình này phục vụ việc viết TỪ ĐẦU —
+ * cần thấy khách hỏi gì, giá bao nhiêu, vướng ở đâu, và cần tạo được kịch bản
+ * khi page chưa có. Màn hình Sửa chỉ để chỉnh chữ trên kịch bản đã chạy.
+ */
+export async function composeView(
+    id: number,
+    opts: { saved?: boolean; error?: string; created?: boolean } = {}
+): Promise<string | null> {
+    const page = await R.pageById(id);
+    if (!page) return null;
+
+    const [data, stored] = await Promise.all([R.activeScript(id), scriptsRepo.getAnalysis(id)]);
+    const report = stored ? (stored.report as unknown as ChatReport) : null;
+
+    const crumb = `<p class="crumb"><a href="/">Tổng quan</a> › <a href="/page/${id}">${esc(page.page_name)}</a> › Soạn nội dung</p>`;
+
+    // ── Chưa phân tích ────────────────────────────────────────────────────
+    if (!report) {
+        return layout("Soạn nội dung", "home",
+            `${crumb}<h1>Chưa có số liệu hội thoại</h1>
+             <div class="warnbox">
+               Khung soạn dựa trên chính hội thoại thật của page này. Chạy phân tích trước
+               (mất vài phút, không tốn phí):<br><br>
+               <code>npm run chat:phan-tich -- --page ${esc(page.page_id)} --so 100</code><br><br>
+               Chạy xong tải lại trang này.
+             </div>`);
+    }
+
+    const slots = suggestSlots(report, report.conversations ? 12 : 12);
+    const messages = data?.messages ?? [];
+
+    // ── Chưa có kịch bản → mời tạo khung rỗng ─────────────────────────────
+    if (!data) {
+        const preview = slots.map((s, i) =>
+            `<tr><td class="r"><b>${i + 1}</b></td><td>${esc(s.label)}</td>
+             <td style="color:var(--ink3);font-size:13px">${esc(s.hint)}</td></tr>`).join("");
+        return layout("Soạn nội dung", "home",
+            `${crumb}<h1>Tạo khung 12 tin cho ${esc(page.page_name)}</h1>
+             <p class="note">Khung dưới đây dựng từ ${report.conversations ?? "?"} hội thoại thật của chính page này.
+                Bấm tạo rồi nhập nội dung — mỗi page một nội dung riêng, không dùng chung.</p>
+             <div class="tw"><table><thead><tr><th class="r">#</th><th>Ô</th><th>Ô này nên trả lời điều gì</th></tr></thead>
+             <tbody>${preview}</tbody></table></div>
+             <form method="POST" action="/page/${id}/soan/tao" style="margin:20px 0">
+               <button type="submit" style="background:var(--accent);color:var(--card);border:0;border-radius:8px;padding:12px 26px;font:inherit;font-weight:700;cursor:pointer">Tạo khung 12 tin</button>
+               <a href="/page/${id}" style="margin-left:14px;color:var(--ink3)">Quay lại</a>
+             </form>`);
+    }
+
+    const banner = opts.error
+        ? `<div class="warnbox" style="background:var(--bad-bg);border-left-color:var(--bad)">❌ ${esc(opts.error)}</div>`
+        : opts.created
+          ? `<div class="warnbox" style="background:var(--ok-bg);border-left-color:var(--ok)">✅ Đã tạo khung. Giờ nhập nội dung vào từng ô rồi bấm Lưu.</div>`
+          : opts.saved
+            ? `<div class="warnbox" style="background:var(--ok-bg);border-left-color:var(--ok)">✅ Đã lưu nội dung.</div>`
+            : "";
+
+    // ── Bảng số liệu tóm tắt, luôn hiện trên đầu ──────────────────────────
+    const priceTop = report.prices?.[0];
+    const facts = `<div class="stats">
+        ${stat("Hội thoại đã đọc", num(report.conversations))}
+        ${stat("Hỏi giá ngay câu đầu",
+            report.withCustomerMessage ? pct(report.priceAskedFirstTurn / report.withCustomerMessage) : "—",
+            "trả lời thẳng ở tin 1–2", "accent")}
+        ${stat("Giá đang báo", priceTop ? `${priceTop.currency} ${priceTop.amount}` : "—",
+            priceTop ? `${priceTop.count} lần` : "không tìm thấy", "ok")}
+        ${stat("Để lại SĐT", pct(report.phoneRate ?? 0), "tỉ lệ hiện tại")}
+        ${stat("Ngôn ngữ chính", report.langs?.[0] ? LANG_LABEL[report.langs[0].lang] ?? report.langs[0].lang : "—",
+            report.langs?.[1] ? `kế tiếp: ${LANG_LABEL[report.langs[1].lang] ?? report.langs[1].lang} ${pct(report.langs[1].pct)}` : undefined)}
+    </div>`;
+
+    // Nhóm không có trích dẫn riêng (dẫn chứng đã hiện ở nhóm trên) thì bỏ hẳn
+    // phần trích, không để lại cặp ngoặc kép rỗng
+    const objList = (report.objections ?? []).slice(0, 6).map((o) => {
+        const q = o.samples?.[0];
+        return `<li><b>${esc(o.label)}</b> — ${o.count} hội thoại${
+            q ? `<div style="color:var(--ink3);font-size:12.5px;margin-top:2px">“${esc(truncate(q, 110))}”</div>`
+              : `<div style="color:var(--ink3);font-size:12.5px;margin-top:2px">cùng tin đã trích ở trên</div>`
+        }</li>`;
+    }).join("");
+
+    // ── Các ô nhập ────────────────────────────────────────────────────────
+    const fields = messages.map((m) => {
+        const s = slots[m.order_index];
+        const chuaNhap = m.body.trim() === "—" || m.body.trim() === "";
+        const when: string[] = [];
+        const sc = data.script;
+        for (let d = 1; d <= sc.journey_days; d++) {
+            for (let k = 0; k < sc.slots_per_day; k++) {
+                if (messageIndexFor(d, k, sc.slots_per_day, messages.length) === m.order_index) {
+                    when.push(`ngày ${d}·${config.journey.slotHours[k]}h`);
+                }
+            }
+        }
+        return `<div class="card" style="margin:12px 0${chuaNhap ? ";border-color:var(--gold)" : ""}">
+            <div style="display:flex;align-items:baseline;gap:11px;flex-wrap:wrap;margin-bottom:7px">
+                <span style="font-family:ui-monospace,monospace;font-size:19px;font-weight:700;color:var(--accent)">${m.order_index + 1}</span>
+                <input type="text" name="label_${m.order_index}" value="${esc(m.label ?? s?.label ?? "")}"
+                       style="flex:1;min-width:190px;max-width:320px;background:var(--card2);border:1px solid var(--line);border-radius:6px;padding:5px 9px;font:inherit;font-size:13px;color:var(--ink)">
+                <span style="font-size:11.5px;color:var(--ink3)">${esc(when.join(" · "))}</span>
+                ${chuaNhap ? badge("chưa nhập", "warn") : ""}
+            </div>
+            ${s ? `<p style="margin:0 0 7px;font-size:13px;color:var(--ink2);background:var(--accent-bg);border-radius:6px;padding:7px 11px">💡 ${esc(s.hint)}</p>` : ""}
+            <textarea name="body_${m.order_index}" rows="4" placeholder="Nhập nội dung tin ${m.order_index + 1}…"
+                      style="width:100%;background:var(--card2);border:1px solid var(--line);border-radius:7px;padding:10px 12px;font:inherit;font-size:14px;line-height:1.55;color:var(--ink);resize:vertical">${esc(chuaNhap ? "" : m.body)}</textarea>
+            ${s?.seed ? `<details style="margin-top:6px"><summary style="cursor:pointer;font-size:12.5px;color:var(--accent)">Xem câu nhân viên đang dùng cho ý này</summary>
+                <div class="msg" style="margin-top:6px">${esc(truncate(s.seed, 600))}</div></details>` : ""}
+            <input type="text" name="media_${m.order_index}" value="${esc(m.media.join(", "))}"
+                   placeholder="link ảnh, nhiều ảnh ngăn bằng dấu phẩy (bỏ trống nếu không có)"
+                   style="width:100%;margin-top:7px;background:var(--card2);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit;font-size:12.5px;color:var(--ink2)">
+        </div>`;
+    }).join("");
+
+    const chuaXong = messages.filter((m) => m.body.trim() === "—" || !m.body.trim()).length;
+
+    const body = `${crumb}
+        <h1>Soạn nội dung <span class="sub">${esc(page.page_name)}</span></h1>
+        ${banner}
+        ${facts}
+        ${card("Vấn đề khiến khách không chốt", objList ? `<ul style="margin:0;padding-left:20px">${objList}</ul>` : `<p class="empty">Chưa phát hiện băn khoăn nào.</p>`,
+            "Các ô B2–B5 bên dưới dựng theo đúng danh sách này")}
+        <p class="note">Số liệu lấy từ ${num(report.conversations)} hội thoại thật, phân tích lúc ${esc(dt(stored!.analyzed_at))}.
+           Muốn cập nhật: chạy lại <code>npm run chat:phan-tich -- --page ${esc(page.page_id)}</code></p>
+        <form method="POST" action="/page/${id}/script">
+            ${fields}
+            <div style="position:sticky;bottom:0;background:var(--card);border:1px solid var(--line);border-radius:11px;padding:14px 18px;margin:18px 0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;box-shadow:0 -2px 12px rgba(0,0,0,.06)">
+                <button type="submit" style="background:var(--accent);color:var(--card);border:0;border-radius:8px;padding:11px 26px;font:inherit;font-weight:700;cursor:pointer">Lưu nội dung</button>
+                <a href="/page/${id}/script" style="color:var(--ink3)">Xem bản đang chạy</a>
+                <span style="margin-left:auto;font-size:12.5px;${chuaXong ? "color:var(--gold);font-weight:600" : "color:var(--ink3)"}">
+                    ${chuaXong ? `còn ${chuaXong}/${messages.length} ô chưa nhập` : `đã nhập đủ ${messages.length} ô`}
+                </span>
+            </div>
+        </form>`;
+    return layout(`Soạn · ${page.page_name}`, "home", body);
+}
+
+/** Tạo khung rỗng 12 tin từ gợi ý. Trả lỗi dạng chữ nếu không tạo được. */
+export async function createSkeleton(id: number): Promise<string | null> {
+    const stored = await scriptsRepo.getAnalysis(id);
+    if (!stored) return "Chưa có số liệu phân tích cho page này";
+    const page = await R.pageById(id);
+    if (!page) return "Không có page này";
+
+    const slots = suggestSlots(stored.report as unknown as ChatReport, 12);
+    try {
+        await scriptsRepo.createEmptyScript(
+            id,
+            `${page.page_name} — ${new Date().toISOString().slice(0, 10)}`,
+            slots.map((s) => s.label)
+        );
         return null;
     } catch (err) {
         return err instanceof Error ? err.message : String(err);

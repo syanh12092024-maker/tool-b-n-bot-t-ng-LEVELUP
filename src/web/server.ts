@@ -82,8 +82,9 @@ export function createDashboardServer() {
 
         // ─── Ghi: sửa nội dung kịch bản ───────────────────────────────────
         if (req.method === "POST") {
+            const create = /^\/page\/(\d+)\/soan\/tao$/.exec(path);
             const save = /^\/page\/(\d+)\/script$/.exec(path);
-            if (!save) return notFound(res, "Không có chỗ nào nhận dữ liệu ở đường dẫn này");
+            if (!create && !save) return notFound(res, "Không có chỗ nào nhận dữ liệu ở đường dẫn này");
 
             // Chống CSRF: form phải được gửi từ chính trang này. Không có session
             // nên dựa vào Origin/Referer — trình duyệt không cho trang khác giả mạo.
@@ -98,10 +99,21 @@ export function createDashboardServer() {
                 return res.end("Yêu cầu không đến từ trang này — đã từ chối");
             }
 
-            const pageDbId = Number(save[1]);
+            if (create) {
+                const pageDbId = Number(create[1]);
+                const err = await views.createSkeleton(pageDbId);
+                res.writeHead(303, {
+                    Location: `/page/${pageDbId}/soan?${err ? `error=${encodeURIComponent(err)}` : "created=1"}`,
+                });
+                return res.end();
+            }
+
+            const pageDbId = Number(save![1]);
             const body = await readBody(req);
             const err = await views.scriptSave(pageDbId, new URLSearchParams(body));
-            const target = `/page/${pageDbId}/script/edit?${err ? `error=${encodeURIComponent(err)}` : "saved=1"}`;
+            // Quay về đúng màn hình người dùng vừa bấm Lưu (soạn hay sửa)
+            const from = (req.headers.referer ?? "").includes("/soan") ? "soan" : "script/edit";
+            const target = `/page/${pageDbId}/${from}?${err ? `error=${encodeURIComponent(err)}` : "saved=1"}`;
             res.writeHead(303, { Location: target });
             return res.end();
         }
@@ -114,6 +126,16 @@ export function createDashboardServer() {
             }
             if (path === "/jobs") return html(res, 200, await views.jobs());
             if (path === "/search") return html(res, 200, await views.search(url.searchParams.get("q") ?? ""));
+
+            const soan = /^\/page\/(\d+)\/soan$/.exec(path);
+            if (soan) {
+                const body = await views.composeView(Number(soan[1]), {
+                    saved: url.searchParams.get("saved") === "1",
+                    created: url.searchParams.get("created") === "1",
+                    error: url.searchParams.get("error") ?? undefined,
+                });
+                return body ? html(res, 200, body) : notFound(res, "Không có page này");
+            }
 
             const edit = /^\/page\/(\d+)\/script\/edit$/.exec(path);
             if (edit) {
