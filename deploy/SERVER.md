@@ -27,6 +27,17 @@ ghi địa chỉ thật ở đây). Ubuntu 24.04, cài tại `/opt/banbot`.
 Job theo lịch dùng `autorestart:false` + `cron_restart` → trạng thái `stopped`
 giữa hai lượt là **bình thường**, không phải lỗi.
 
+### ⚠️ Đổi lịch chạy thì phải TẠO LẠI tiến trình
+
+`pm2 restart` **không** nạp lại `cron_restart` — pm2 vẫn chạy lịch cũ và không
+báo gì. Kiểm tra lịch thật bằng `pm2 describe banbot-send | grep cron`.
+
+```bash
+pm2 delete banbot-send && pm2 start ecosystem.config.cjs --only banbot-send && pm2 save
+```
+
+Hoặc chạy `RELOAD_CRON=1 bash deploy/deploy.sh` để nạp lại lịch cho cả 4 job.
+
 ## Lệnh hay dùng
 
 ```bash
