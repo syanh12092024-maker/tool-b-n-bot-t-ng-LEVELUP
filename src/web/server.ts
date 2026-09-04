@@ -18,6 +18,10 @@ import { layout, esc } from "./html.js";
 
 const log = jobLogger("web");
 const PORT = Number(process.env.DASHBOARD_PORT ?? 8090);
+// Chỉ nghe trên localhost: nginx là cửa duy nhất vào từ ngoài. Nghe trên mọi
+// giao diện mạng nghĩa là ai cũng vào thẳng cổng này được, bỏ qua nginx và
+// mọi lớp bảo vệ đặt ở đó. Đặt DASHBOARD_HOST=0.0.0.0 nếu thật sự cần mở.
+const HOST = process.env.DASHBOARD_HOST ?? "127.0.0.1";
 const USER = process.env.DASHBOARD_USER || "admin";
 const PASS = process.env.DASHBOARD_PASSWORD || "";
 
@@ -177,8 +181,8 @@ export function createDashboardServer() {
 
 if (isMain(import.meta.url)) {
     const server = createDashboardServer();
-    server.listen(PORT, () => {
-        log.info({ port: PORT, secured: Boolean(PASS) }, `Dashboard: http://localhost:${PORT}`);
+    server.listen(PORT, HOST, () => {
+        log.info({ host: HOST, port: PORT, secured: Boolean(PASS) }, `Dashboard: http://${HOST}:${PORT}`);
         if (!PASS) log.warn("DASHBOARD_PASSWORD trống — ai vào được cổng này cũng xem được dữ liệu khách. Đặt mật khẩu trước khi mở ra Internet.");
     });
 

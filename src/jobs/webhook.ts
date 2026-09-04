@@ -25,6 +25,12 @@ import * as queueRepo from "../db/repositories/queue.repo.js";
 
 const log = jobLogger("webhook");
 
+// Chỉ nghe localhost. Webhook nhận báo ĐƠN HÀNG và tin khách — mở ra Internet
+// khi WEBHOOK_SECRET còn trống nghĩa là ai cũng gửi đơn giả vào được, khiến
+// khách thật bị đánh dấu "đã mua" và ngừng nhận tin. Khi nào cấu hình secret
+// và trỏ nginx vào thì đặt WEBHOOK_HOST=0.0.0.0.
+const WEBHOOK_HOST = process.env.WEBHOOK_HOST ?? "127.0.0.1";
+
 interface MessageEvent {
     pageId: string;
     psid: string;
@@ -180,7 +186,7 @@ export function createWebhookServer() {
 // ─── Chạy độc lập ─────────────────────────────────────────────────────────────
 if (isMain(import.meta.url)) {
     const server = createWebhookServer();
-    server.listen(config.webhook.port, () => {
+    server.listen(config.webhook.port, WEBHOOK_HOST, () => {
         log.info(
             { port: config.webhook.port, secured: Boolean(config.webhook.secret), stopOnReply: config.journey.stopOnReply },
             "Webhook đang nghe"

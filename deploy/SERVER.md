@@ -83,3 +83,32 @@ pm2 restart banbot-ui
 ```
 
 Build mất vài phút. **Phải có `nohup`** — không thì build chết theo phiên SSH.
+
+## Cổng và bảo mật
+
+Cả ba tiến trình web chỉ nghe trên **127.0.0.1**, nginx là cửa duy nhất vào từ ngoài.
+
+| Cổng | Nghe ở | Vào từ ngoài qua |
+|---|---|---|
+| 3112 | 127.0.0.1 | nginx `:8447` (basic-auth) — giao diện chính, **có nút gửi tin** |
+| 3110 | 127.0.0.1 | nginx `:8446` (mật khẩu ở app) — dashboard chỉ đọc |
+| 3111 | 127.0.0.1 | **chưa mở** — webhook, xem cảnh báo dưới |
+
+Kiểm chứng lại bất cứ lúc nào — cả ba phải **không kết nối được**:
+
+```bash
+for p in 3110 3111 3112; do curl -m 5 -o /dev/null -w "$p: %{http_code}\n" http://<IP>:$p/; done
+```
+
+### Vì sao webhook chưa mở
+
+`WEBHOOK_SECRET` còn trống. Mở cổng 3111 ra Internet khi chưa có secret nghĩa là
+**ai cũng gửi đơn giả vào được**, khiến khách thật bị đánh dấu "đã mua" và ngừng
+nhận tin. Muốn mở: đặt `WEBHOOK_SECRET` trong `.env`, đổi `WEBHOOK_HOST=0.0.0.0`,
+rồi thêm site nginx trỏ vào.
+
+### Một mật khẩu, không phải hai
+
+Giao diện chính chặn ở **tầng nginx**, nên app không đòi `APP_ACCESS_KEY` nữa —
+bắt người dùng nhập mật khẩu hai lần là dở mà không an toàn hơn. An toàn đến từ
+việc cổng app không mở ra ngoài, chứ không phải từ số lần hỏi mật khẩu.

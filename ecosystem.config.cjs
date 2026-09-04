@@ -26,7 +26,7 @@ module.exports = {
             // Giao diện chính (Next.js, kế thừa từ v1): chạy liên tục
             name: "banbot-ui",
             script: "node_modules/next/dist/bin/next",
-            args: "start -p 3112",
+            args: "start -p 3112 -H 127.0.0.1",   // chỉ nghe localhost — nginx là cửa duy nhất
             cwd: `${cwd}/web`,
             autorestart: true,
             max_restarts: 50,
