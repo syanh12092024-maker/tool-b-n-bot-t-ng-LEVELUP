@@ -1,6 +1,7 @@
 import { config } from "../config/index.js";
 import { messageIndexFor } from "../domain/journey.js";
 import * as R from "../db/repositories/report.repo.js";
+import * as scriptsRepo from "../db/repositories/scripts.repo.js";
 import {
     esc, num, pct, ago, dt, dtLocal, truncate, badge, healthBadge, statusBadge,
     bar, table, stat, card, layout, type Col,
@@ -193,7 +194,10 @@ export async function scriptView(id: number): Promise<string | null> {
         <h1>${esc(script.name)} <span class="sub">${n} nội dung · ${script.journey_days} ngày × ${script.slots_per_day} khung</span></h1>
         ${card("Lịch một khách sẽ nhận", rotation, `Số trong ô là tin thứ mấy. Ô nền vàng là lần lặp lại — công thức ((ngày−1)×${script.slots_per_day}+khung) mod ${n}`)}
         ${card("Nội dung", table(msgCols, messages))}
-        <p class="note">Sửa nội dung: cập nhật file kịch bản rồi chạy lại <code>npm run script:seed</code>. Kịch bản cũ được giữ lại, không xoá.</p>`;
+        <p style="margin:18px 0">
+            <a href="/page/${id}/script/edit"
+               style="display:inline-block;background:var(--accent);color:var(--card);border-radius:8px;padding:11px 24px;font-weight:700;text-decoration:none">✏️ Sửa nội dung</a>
+        </p>`;
     return layout(`Kịch bản · ${page.page_name}`, "home", body);
 }
 
@@ -338,4 +342,104 @@ export async function jobs(): Promise<string> {
     ];
     return layout("Nhật ký job", "jobs", `<h1>Nhật ký job</h1>
         ${card("40 lượt chạy gần nhất", table(cols, runs, "Chưa job nào chạy"), "sync · plan · send · pos · health")}`);
+}
+
+// ═══ Sửa kịch bản ═════════════════════════════════════════════════════════════
+
+/**
+ * Màn hình sửa 12 nội dung ngay trên web.
+ *
+ * Đây là màn hình DUY NHẤT ghi dữ liệu. Lý do phá lệ "dashboard chỉ đọc": bắt
+ * người vận hành SSH vào server rồi sửa file JSON để đổi một câu chữ là không
+ * dùng được. Việc này họ làm hằng tuần.
+ *
+ * An toàn: chỉ sửa được CHỮ và ẢNH của tin, không đụng được tới việc bật/tắt
+ * page hay hàng đợi gửi — hai thứ đó vẫn phải qua CLI.
+ */
+export async function scriptEdit(id: number, opts: { saved?: boolean; error?: string } = {}): Promise<string | null> {
+    const page = await R.pageById(id);
+    if (!page) return null;
+    const data = await R.activeScript(id);
+
+    if (!data) {
+        return layout("Sửa kịch bản", "home",
+            `<p class="crumb"><a href="/">Tổng quan</a> › <a href="/page/${id}">${esc(page.page_name)}</a></p>
+             <h1>Page này chưa có kịch bản</h1>
+             <div class="warnbox">Cần nạp kịch bản lần đầu bằng dòng lệnh, sau đó mới sửa được trên web:<br>
+             <code>bash kich-ban/capnhat.sh ${esc(page.page_id)} &lt;tên-file&gt;.json</code></div>`);
+    }
+
+    const { script, messages } = data;
+    const n = messages.length;
+
+    const banner = opts.error
+        ? `<div class="warnbox" style="background:var(--bad-bg);border-left-color:var(--bad)">❌ ${esc(opts.error)}</div>`
+        : opts.saved
+          ? `<div class="warnbox" style="background:var(--ok-bg);border-left-color:var(--ok)">✅ Đã lưu. Các tin gửi từ giờ trở đi sẽ dùng nội dung mới.</div>`
+          : "";
+
+    const fields = messages.map((m) => {
+        // Tin này rơi vào ngày nào, khung nào — giúp người sửa hình dung ngữ cảnh
+        const when: string[] = [];
+        for (let d = 1; d <= script.journey_days; d++) {
+            for (let s = 0; s < script.slots_per_day; s++) {
+                if (messageIndexFor(d, s, script.slots_per_day, n) === m.order_index) {
+                    when.push(`ngày ${d} · ${config.journey.slotHours[s]}h`);
+                }
+            }
+        }
+        const chuaDien = /\[ĐIỀN|\[THAY/.test(m.body);
+        return `<div class="card" style="margin:12px 0${chuaDien ? ";border-color:var(--gold)" : ""}">
+            <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:8px">
+                <span style="font-family:ui-monospace,monospace;font-size:19px;font-weight:700;color:var(--accent)">${m.order_index + 1}</span>
+                <input type="text" name="label_${m.order_index}" value="${esc(m.label ?? "")}"
+                       placeholder="nhãn ghi nhớ, ví dụ: báo giá"
+                       style="flex:1;min-width:170px;max-width:280px;background:var(--card2);border:1px solid var(--line);border-radius:6px;padding:5px 9px;font:inherit;font-size:13px;color:var(--ink)">
+                <span style="font-size:12px;color:var(--ink3)">gửi vào: ${esc(when.join(" · "))}</span>
+                ${chuaDien ? badge("chưa điền xong", "warn") : ""}
+            </div>
+            <textarea name="body_${m.order_index}" rows="4"
+                      style="width:100%;background:var(--card2);border:1px solid var(--line);border-radius:7px;padding:10px 12px;font:inherit;font-size:14px;line-height:1.55;color:var(--ink);resize:vertical">${esc(m.body)}</textarea>
+            <input type="text" name="media_${m.order_index}" value="${esc(m.media.join(", "))}"
+                   placeholder="link ảnh, nhiều ảnh thì ngăn bằng dấu phẩy (để trống nếu không có)"
+                   style="width:100%;margin-top:7px;background:var(--card2);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit;font-size:12.5px;color:var(--ink2)">
+        </div>`;
+    }).join("");
+
+    const body = `<p class="crumb"><a href="/">Tổng quan</a> › <a href="/page/${id}">${esc(page.page_name)}</a> › <a href="/page/${id}/script">Kịch bản</a> › Sửa</p>
+        <h1>Sửa nội dung <span class="sub">${esc(page.page_name)} · ${n} tin</span></h1>
+        ${banner}
+        <p class="note">Sửa chữ trong ô rồi bấm <b>Lưu</b> ở cuối trang. Mỗi tin phải có chữ hoặc ảnh, không được để trống cả hai.</p>
+        <form method="POST" action="/page/${id}/script">
+            ${fields}
+            <div style="position:sticky;bottom:0;background:var(--card);border:1px solid var(--line);border-radius:11px;padding:14px 18px;margin:18px 0;display:flex;gap:12px;align-items:center;box-shadow:0 -2px 12px rgba(0,0,0,.06)">
+                <button type="submit" style="background:var(--accent);color:var(--card);border:0;border-radius:8px;padding:11px 26px;font:inherit;font-weight:700;cursor:pointer">Lưu nội dung</button>
+                <a href="/page/${id}/script" style="color:var(--ink3)">Huỷ, quay lại</a>
+                <span style="margin-left:auto;font-size:12.5px;color:var(--ink3)">Không đụng tới việc bật/tắt page</span>
+            </div>
+        </form>`;
+    return layout(`Sửa · ${page.page_name}`, "home", body);
+}
+
+/** Nhận dữ liệu form gửi lên. Trả về lỗi dạng chữ nếu không lưu được. */
+export async function scriptSave(id: number, form: URLSearchParams): Promise<string | null> {
+    const data = await R.activeScript(id);
+    if (!data) return "Page này chưa có kịch bản";
+
+    const edits = data.messages.map((m) => ({
+        orderIndex: m.order_index,
+        body: form.get(`body_${m.order_index}`) ?? m.body,
+        media: (form.get(`media_${m.order_index}`) ?? "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
+        label: (form.get(`label_${m.order_index}`) ?? "").trim() || null,
+    }));
+
+    try {
+        await scriptsRepo.updateMessageBodies(data.script.id, edits);
+        return null;
+    } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+    }
 }

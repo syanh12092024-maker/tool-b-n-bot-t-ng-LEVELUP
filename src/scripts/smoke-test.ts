@@ -573,7 +573,9 @@ try {
     eq("Trang không tồn tại → 404", (await get("/khong-co-trang-nay")).status, 404);
     eq("Page id không tồn tại → 404", (await get("/page/999999")).status, 404);
     eq("Khách id không tồn tại → 404", (await get("/customer/999999")).status, 404);
-    eq("POST bị từ chối (dashboard chỉ đọc)", (await fetch(wb + "/", { method: "POST" })).status, 405);
+    // Chỉ /page/:id/script nhận POST; mọi đường dẫn khác không có chỗ ghi
+    eq("POST vào đường dẫn không ghi được → 404", (await fetch(wb + "/", { method: "POST", headers: { Origin: wb } })).status, 404);
+    eq("PUT/DELETE vẫn bị từ chối hoàn toàn", (await fetch(wb + "/", { method: "DELETE" })).status, 405);
 
     await new Promise<void>((r) => web.close(() => r()));
     await query(`DELETE FROM pages WHERE page_id = 'SMOKE_WEB'`);
@@ -611,6 +613,90 @@ try {
         if (savedPm2 === undefined) delete process.env.pm_exec_path;
         else process.env.pm_exec_path = savedPm2;
     }
+
+    // ═══ 17. SỬA KỊCH BẢN TRÊN WEB ══════════════════════════════════════════
+    section("Sửa kịch bản trên web");
+    const ePage = await pagesRepo.upsert({ pageId: "SMOKE_EDIT", pageName: "Page sửa", market: "Test", utcOffset });
+    await pagesRepo.setActive(ePage.id, true, 100);
+    const eScript = await scriptsRepo.replaceActiveScript(ePage.id, "KB sửa", messages, { journeyDays: 7, slotsPerDay: 4 });
+    const eMsgs = await scriptsRepo.messagesForScript(eScript.script.id);
+    const firstId = eMsgs[0]!.id;
+
+    // Có nhật ký gửi trỏ vào tin này → id PHẢI giữ nguyên sau khi sửa
+    await customersRepo.upsertBatch(ePage.id, [mk("E1", 1)]);
+    const eCust = (await customersRepo.findByPsid(ePage.id, "E1"))!;
+    await query(
+        `INSERT INTO send_log (customer_id, page_id, script_message_id, journey_day, slot_index, channel, success)
+         VALUES ($1, $2, $3, 1, 0, 'pancake', TRUE)`, [eCust.id, ePage.id, firstId]);
+
+    const edited = await scriptsRepo.updateMessageBodies(eScript.script.id, [
+        { orderIndex: 0, body: "Nội dung MỚI cho tin 1", media: ["https://x/a.jpg"], label: "nhãn mới" },
+        { orderIndex: 1, body: "Nội dung MỚI cho tin 2", media: [], label: null },
+    ]);
+    eq("Sửa 2 tin", edited, 2);
+    const afterEdit = await scriptsRepo.messagesForScript(eScript.script.id);
+    eq("Chữ đã đổi", afterEdit[0]?.body, "Nội dung MỚI cho tin 1");
+    eq("Ảnh đã đổi", afterEdit[0]?.media, ["https://x/a.jpg"]);
+    eq("Nhãn đã đổi", afterEdit[0]?.label, "nhãn mới");
+    eq("Nhãn để trống thì giữ nhãn cũ", afterEdit[1]?.label, eMsgs[1]?.label);
+    eq("⭐ id của tin GIỮ NGUYÊN — báo cáo không mất lịch sử", afterEdit[0]?.id, firstId);
+    eq("…nhật ký gửi vẫn trỏ đúng tin đó",
+        (await queryOne<{ n: number }>(`SELECT COUNT(*)::int AS n FROM send_log WHERE script_message_id = $1`, [firstId]))?.n, 1);
+    eq("Số tin không đổi (không tạo thêm bản mới)", afterEdit.length, 12);
+    eq("Vẫn chỉ 1 kịch bản đang bật",
+        (await queryOne<{ n: number }>(`SELECT COUNT(*)::int AS n FROM scripts WHERE page_id = $1 AND is_active`, [ePage.id]))?.n, 1);
+
+    let rejectedEmpty = false;
+    try {
+        await scriptsRepo.updateMessageBodies(eScript.script.id, [{ orderIndex: 2, body: "   ", media: [], label: null }]);
+    } catch (err) {
+        rejectedEmpty = /bỏ trống/.test(err instanceof Error ? err.message : "");
+    }
+    check("Từ chối tin rỗng, báo lỗi tiếng Việt rõ ràng", rejectedEmpty);
+    eq("…và KHÔNG ghi đè tin nào khi có lỗi (transaction)",
+        (await scriptsRepo.messagesForScript(eScript.script.id))[2]?.body, eMsgs[2]?.body);
+
+    // HTTP: form + chống CSRF
+    const { createDashboardServer: mkSrv } = await import("../web/server.js");
+    const web2 = mkSrv();
+    const port2 = 19900 + Math.floor(Math.random() * 90);
+    await new Promise<void>((r) => web2.listen(port2, () => r()));
+    const base2 = `http://127.0.0.1:${port2}`;
+
+    eq("GET trang sửa trả 200", (await fetch(`${base2}/page/${ePage.id}/script/edit`)).status, 200);
+    const editHtml = await (await fetch(`${base2}/page/${ePage.id}/script/edit`)).text();
+    check("Form có đủ 12 ô nhập", (editHtml.match(/name="body_\d+"/g) ?? []).length === 12);
+    check("Trang kịch bản có nút Sửa", (await (await fetch(`${base2}/page/${ePage.id}/script`)).text()).includes("Sửa nội dung"));
+
+    const formBody = new URLSearchParams({ "body_0": "Sửa qua web", "media_0": "", "label_0": "web" });
+    const noRef = await fetch(`${base2}/page/${ePage.id}/script`, {
+        method: "POST", body: formBody, redirect: "manual",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    eq("⭐ POST không có Origin/Referer → 403 (chống CSRF)", noRef.status, 403);
+    eq("…nội dung KHÔNG bị đổi", (await scriptsRepo.messagesForScript(eScript.script.id))[0]?.body, "Nội dung MỚI cho tin 1");
+
+    const withOrigin = await fetch(`${base2}/page/${ePage.id}/script`, {
+        method: "POST", body: formBody, redirect: "manual",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: base2 },
+    });
+    eq("POST từ đúng trang → 303 chuyển hướng", withOrigin.status, 303);
+    check("…chuyển về trang sửa kèm báo đã lưu", (withOrigin.headers.get("location") ?? "").includes("saved=1"));
+    eq("…nội dung đã lưu thật", (await scriptsRepo.messagesForScript(eScript.script.id))[0]?.body, "Sửa qua web");
+
+    const evilOrigin = await fetch(`${base2}/page/${ePage.id}/script`, {
+        method: "POST", body: new URLSearchParams({ "body_0": "HACK" }), redirect: "manual",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: "http://ke-gian.example.com" },
+    });
+    eq("⭐ POST từ trang lạ → 403", evilOrigin.status, 403);
+    eq("…nội dung vẫn nguyên", (await scriptsRepo.messagesForScript(eScript.script.id))[0]?.body, "Sửa qua web");
+
+    eq("POST vào đường dẫn không nhận dữ liệu → 404",
+        (await fetch(`${base2}/`, { method: "POST", headers: { Origin: base2 } })).status, 404);
+    eq("PUT vẫn bị từ chối", (await fetch(`${base2}/`, { method: "PUT" })).status, 405);
+
+    await new Promise<void>((r) => web2.close(() => r()));
+    await query(`DELETE FROM pages WHERE page_id = 'SMOKE_EDIT'`);
 
     await closePool();
 } catch (err) {

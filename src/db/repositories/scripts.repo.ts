@@ -72,3 +72,38 @@ export async function updateMessage(id: number, patch: Partial<MessageInput>): P
         [id, patch.label ?? null, patch.body ?? null, patch.media ?? null]
     );
 }
+
+/**
+ * Sửa nội dung kịch bản đang bật, GIỮ NGUYÊN id của từng tin.
+ *
+ * Khác với replaceActiveScript (tạo kịch bản mới, tắt bản cũ): hàm này dùng cho
+ * việc sửa chữ trên dashboard. Giữ nguyên script_message_id là điều bắt buộc —
+ * send_log và send_queue đang trỏ vào đó, tạo bản mới sẽ làm báo cáo "tin nào ra
+ * đơn" mất hết lịch sử của tin cũ.
+ */
+export async function updateMessageBodies(
+    scriptId: number,
+    edits: Array<{ orderIndex: number; body: string; media: string[]; label?: string | null }>
+): Promise<number> {
+    if (edits.length === 0) return 0;
+
+    return withTransaction(async (client) => {
+        let changed = 0;
+        for (const e of edits) {
+            const body = e.body.trim();
+            const media = e.media.filter((u) => u.trim());
+            // Ràng buộc CHECK ở DB cũng chặn, nhưng báo lỗi ở đây thì rõ hơn cho người dùng
+            if (!body && media.length === 0) {
+                throw new Error(`Tin số ${e.orderIndex + 1} bị bỏ trống — mỗi tin phải có chữ hoặc ảnh`);
+            }
+            const res = await client.query(
+                `UPDATE script_messages
+                    SET body = $3, media = $4, label = COALESCE($5, label)
+                  WHERE script_id = $1 AND order_index = $2`,
+                [scriptId, e.orderIndex, body, media, e.label ?? null]
+            );
+            changed += res.rowCount ?? 0;
+        }
+        return changed;
+    });
+}

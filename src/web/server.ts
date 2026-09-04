@@ -37,6 +37,25 @@ function authorized(req: IncomingMessage): boolean {
     return safeEqual(user, USER) && safeEqual(rest.join(":"), PASS);
 }
 
+/** Đọc thân POST, chặn ở 1MB để một request hỏng không nuốt hết bộ nhớ. */
+function readBody(req: IncomingMessage): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        req.on("data", (c: Buffer) => {
+            size += c.length;
+            if (size > 1_000_000) {
+                reject(new Error("Nội dung gửi lên quá lớn"));
+                req.destroy();
+                return;
+            }
+            chunks.push(c);
+        });
+        req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+        req.on("error", reject);
+    });
+}
+
 function html(res: ServerResponse, status: number, body: string): void {
     res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
     res.end(body);
@@ -51,14 +70,40 @@ export function createDashboardServer() {
         const url = new URL(req.url ?? "/", "http://localhost");
         const path = url.pathname;
 
-        if (req.method !== "GET") {
+        if (req.method !== "GET" && req.method !== "POST") {
             res.writeHead(405, { "Content-Type": "text/plain; charset=utf-8" });
-            return res.end("Dashboard chỉ đọc — mọi thay đổi làm qua CLI");
+            return res.end("Chỉ hỗ trợ GET và POST");
         }
 
         if (!authorized(req)) {
             res.writeHead(401, { "WWW-Authenticate": 'Basic realm="Ban bot TALPHA", charset="UTF-8"' });
             return res.end("Cần đăng nhập");
+        }
+
+        // ─── Ghi: sửa nội dung kịch bản ───────────────────────────────────
+        if (req.method === "POST") {
+            const save = /^\/page\/(\d+)\/script$/.exec(path);
+            if (!save) return notFound(res, "Không có chỗ nào nhận dữ liệu ở đường dẫn này");
+
+            // Chống CSRF: form phải được gửi từ chính trang này. Không có session
+            // nên dựa vào Origin/Referer — trình duyệt không cho trang khác giả mạo.
+            const origin = req.headers.origin ?? "";
+            const referer = req.headers.referer ?? "";
+            const host = req.headers.host ?? "";
+            const sameSite =
+                (origin !== "" && origin.endsWith(host)) ||
+                (origin === "" && referer !== "" && new URL(referer).host === host);
+            if (!sameSite) {
+                res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+                return res.end("Yêu cầu không đến từ trang này — đã từ chối");
+            }
+
+            const pageDbId = Number(save[1]);
+            const body = await readBody(req);
+            const err = await views.scriptSave(pageDbId, new URLSearchParams(body));
+            const target = `/page/${pageDbId}/script/edit?${err ? `error=${encodeURIComponent(err)}` : "saved=1"}`;
+            res.writeHead(303, { Location: target });
+            return res.end();
         }
 
         try {
@@ -69,6 +114,15 @@ export function createDashboardServer() {
             }
             if (path === "/jobs") return html(res, 200, await views.jobs());
             if (path === "/search") return html(res, 200, await views.search(url.searchParams.get("q") ?? ""));
+
+            const edit = /^\/page\/(\d+)\/script\/edit$/.exec(path);
+            if (edit) {
+                const body = await views.scriptEdit(Number(edit[1]), {
+                    saved: url.searchParams.get("saved") === "1",
+                    error: url.searchParams.get("error") ?? undefined,
+                });
+                return body ? html(res, 200, body) : notFound(res, "Không có page này");
+            }
 
             const script = /^\/page\/(\d+)\/script$/.exec(path);
             if (script) {

@@ -67,7 +67,7 @@ Dùng cho máy dev; trên VPS dùng Postgres cài đặt thật.
 ## Kiểm tra
 
 ```bash
-npm run test:smoke          # 167 kiểm tra tích hợp trên Postgres nhúng tạm
+npm run test:smoke          # 195 kiểm tra tích hợp trên Postgres nhúng tạm
 ```
 
 Bộ kiểm tra dựng DB sạch, chạy migration, rồi đi qua đúng luồng SYNC → PLAN → SEND →
@@ -83,6 +83,7 @@ POS → HEALTH → WEBHOOK → DASHBOARD bằng dữ liệu giả. Không cần 
 - Mốc chuẩn POS: khách mua từ trước vẫn được nuôi dưỡng, mua thêm thì mới dừng
 - Dashboard escape tên khách lấy từ Facebook (không chèn được thẻ script)
 - Báo cáo quy công đúng vào tin cuối khách nhận trước lúc chốt
+- Sửa kịch bản trên web: giữ nguyên id tin, chặn POST từ trang lạ (CSRF)
 
 Phần **không** được phủ: gọi API Pancake/Facebook thật (cần token — dùng `npm run check:tokens`).
 
@@ -153,14 +154,19 @@ npm run seed:demo                            # dữ liệu mẫu để xem dashb
 npm run web        # → http://localhost:8090
 ```
 
-Chỉ đọc — **không có nút nào ghi dữ liệu**. Mọi thay đổi (thêm page, nạp kịch bản, bật/tắt) đều
-qua CLI. Nhờ vậy dashboard không thể làm hỏng chiến dịch đang chạy và không cần lo CSRF.
+Sửa được **nội dung kịch bản** ngay trên web (`/page/:id/script/edit`) — việc này làm hằng tuần,
+bắt SSH vào server sửa file JSON là không dùng được. Mọi thứ còn lại (thêm page, **bật/tắt page**,
+hàng đợi gửi) vẫn chỉ qua CLI, nên dashboard không thể tự ý bật một chiến dịch.
+
+Form lưu có chặn CSRF bằng `Origin`/`Referer`. Khi sửa, **id của từng tin được giữ nguyên** — nếu
+tạo bản ghi mới thì báo cáo "tin nào ra đơn" sẽ mất sạch lịch sử của tin cũ.
 
 | Trang | Trả lời câu hỏi |
 |---|---|
 | `/` Tổng quan | Page nào đang chạy, bao nhiêu khách đang nuôi, hôm nay gửi được bao nhiêu, page nào đang bị ngưng |
 | `/page/:id` | Khách phân bố ở ngày nào, hàng đợi ra sao, lỗi gì trong 24h, sức khoẻ page theo từng 15 phút |
 | `/page/:id/script` | 12 nội dung + bảng lịch: khách nhận tin số mấy vào ngày nào |
+| `/page/:id/script/edit` | **sửa nội dung ngay trên web** — ô nào chưa điền xong có cảnh báo |
 | `/report` | **Tin nào ra đơn nhiều nhất** · khách thường chốt ở ngày thứ mấy |
 | `/customer/:id` | Một khách đã nhận gì, lúc nào, qua kênh nào, sắp nhận gì |
 | `/search?q=` | Tra theo tên · số điện thoại · PSID |
@@ -266,7 +272,7 @@ src/db/                      pool · migrate · repositories/ (pages, customers,
 src/jobs/                    sync · plan · send · pos · health · webhook
 src/web/                     server.ts (định tuyến) · views.ts (các trang) · html.ts (CSS + escape)
 src/scripts/                 check-db · check-tokens · page:add · page:list · script:seed
-                             smoke-test.ts (167 kiểm tra) · dev-db.ts · seed-demo.ts
+                             smoke-test.ts (195 kiểm tra) · dev-db.ts · seed-demo.ts
 config/                      pos-shops.json (gitignore, chép từ .example) — khoá POS từng shop
 kich-ban/                    nội dung kịch bản (mau.json là khung)
 deploy/                      crontab + systemd mẫu
